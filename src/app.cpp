@@ -2750,21 +2750,13 @@ void App::onMouseMove(double mx, double my) {
     }
 
     if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
+        // Hover-follow is a lightweight preview path on Mac. Committing to a new
+        // station happens on click/lock, which is where downloads/live-loop work
+        // should start. Doing that work here causes catastrophic mouse lag.
         m_activeStationIdx = bestIdx;
-        invalidateLiveLoop(false);
-        bool needsUpload = false;
-        bool hasLocalLoopHistory = false;
-        {
-            std::lock_guard<std::mutex> lock(m_stationMutex);
-            needsUpload = !stationUploadMatchesSelection(m_stations[bestIdx]);
-            hasLocalLoopHistory = !m_stations[bestIdx].live_history.empty();
-        }
-        if (needsUpload)
-            uploadStation(bestIdx);
-        if (!m_snapshotMode && !m_historicMode)
-            queueLiveStationRefresh(bestIdx, true);
-        if (hasLocalLoopHistory && m_liveLoopEnabled && !m_snapshotMode && !m_historicMode && !m_showAll)
-            requestLiveLoopBackfill();
+        refreshActiveTiltMetadata();
+        if (m_crossSection || m_mode3D)
+            rebuildVolumeForCurrentSelection();
         m_needsRerender = true;
         m_needsComposite = true;
     }
