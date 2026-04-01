@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://macdar.local/schemas/frame_snapshot.schema.json",
+  "title": "RadarFrameSnapshot",
+  "type": "object",
+  "required": ["station_id", "generated_at_unix_ms", "local_xy", "sweeps"],
+  "properties": {
+    "station_id": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 8
+    },
+    "generated_at_unix_ms": {
+      "type": "integer"
+    },
+    "local_xy": {
+      "type": "object",
+      "required": ["origin_lat_deg", "origin_lon_deg", "meters_per_unit"],
+      "properties": {
+        "origin_lat_deg": { "type": "number" },
+        "origin_lon_deg": { "type": "number" },
+        "meters_per_unit": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "sweeps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["moment", "elevation_deg", "radial_count", "gate_count", "bin_codes"],
+        "properties": {
+          "moment": { "type": "string" },
+          "elevation_deg": { "type": "number" },
+          "radial_count": { "type": "integer", "minimum": 0 },
+          "gate_count": { "type": "integer", "minimum": 0 },
+          "bin_codes": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        }
+      }
+    }
+  }
+}

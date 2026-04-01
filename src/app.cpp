@@ -1,0 +1,3490 @@
+#include "app.h"
+#include "nexrad/stations.h"
+#include "nexrad/level2_parser.h"
+#include "data/us_boundaries.h"
+#include "net/aws_nexrad.h"
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <limits>
+#include <unordered_set>
+
+namespace {
+
+constexpr float kPi = 3.14159265f;
+constexpr float kDegToRad = kPi / 180.0f;
+constexpr float kInvalidSample = -9999.0f;
+using Clock = std::chrono::steady_clock;
+
+float elapsedMs(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<float, std::milli>(end - start).count();
+}
+
+bool extractArchiveTime(const std::string& fname, int& hh, int& mm, int& ss) {
+    size_t us = fname.find('_');
+    if (us == std::string::npos || us + 7 > fname.size()) return false;
+    const std::string timeStr = fname.substr(us + 1, 6);
+    if (timeStr.size() != 6) return false;
+    hh = std::stoi(timeStr.substr(0, 2));
+    mm = std::stoi(timeStr.substr(2, 2));
+    ss = std::stoi(timeStr.substr(4, 2));
+    return true;
+}
+
+std::string filenameFromKey(const std::string& key) {
+    size_t slash = key.rfind('/');
+    return (slash != std::string::npos) ? key.substr(slash + 1) : key;
+}
+
+bool isDigitSpan(const std::string& text, size_t pos, size_t count) {
+    if (pos + count > text.size()) return false;
+    for (size_t i = 0; i < count; i++) {
+        const unsigned char ch = (unsigned char)text[pos + i];
+        if (ch < '0' || ch > '9')
+            return false;
+    }
+    return true;
+}
+
+std::string formatVolumeKeyTimestamp(const std::string& key) {
+    const std::string filename = filenameFromKey(key);
+    if (filename.empty()) return {};
+
+    for (size_t i = 0; i < filename.size(); i++) {
+        if (!isDigitSpan(filename, i, 8))
+            continue;
+
+        size_t timePos = std::string::npos;
+        if (i + 15 <= filename.size() && filename[i + 8] == '_' && isDigitSpan(filename, i + 9, 6))
+            timePos = i + 9;
+        else if (i + 14 <= filename.size() && isDigitSpan(filename, i + 8, 6))
+            timePos = i + 8;
+
+        if (timePos == std::string::npos)
+            continue;
+
+        return filename.substr(i, 4) + "-" +
+               filename.substr(i + 4, 2) + "-" +
+               filename.substr(i + 6, 2) + " " +
+               filename.substr(timePos, 2) + ":" +
+               filename.substr(timePos + 2, 2) + ":" +
+               filename.substr(timePos + 4, 2) + " UTC";
+    }
+
+    return filename;
+}
+
+bool extractVolumeKeyDate(const std::string& key, int& year, int& month, int& day) {
+    const std::string filename = filenameFromKey(key);
+    if (filename.empty()) return false;
+
+    for (size_t i = 0; i < filename.size(); i++) {
+        if (!isDigitSpan(filename, i, 8))
+            continue;
+
+        year = std::stoi(filename.substr(i, 4));
+        month = std::stoi(filename.substr(i + 4, 2));
+        day = std::stoi(filename.substr(i + 6, 2));
+        return true;
+    }
+
+    return false;
+}
+
+std::string makeIsoUtcTimestamp(int year, int month, int day, int hour, int minute, int second = 0) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                  year, month, day, hour, minute, second);
+    return buffer;
+}
+
+float stationPollJitter(int stationIdx) {
+    return 0.85f + 0.03f * float((stationIdx * 7) % 11);
+}
+
+std::string buildLiveListQuery(const std::string& station, int year, int month, int day,
+                               const std::string& currentKey) {
+    std::string listPath = buildListUrl(station, year, month, day);
+    std::string query = "/?list-type=2&prefix=" + std::string(listPath.data() + 1);
+    if (!currentKey.empty())
+        query += "&start-after=" + currentKey;
+    else
+        query += "&max-keys=1000";
+    return query;
+}
+
+std::string buildRecentLiveTailQuery(const std::string& station,
+                                     int minutesBack = 45,
+                                     int maxKeys = 64) {
+    time_t t = time(nullptr);
+    struct tm utc;
+#ifdef _WIN32
+    gmtime_s(&utc, &t);
+#else
+    gmtime_r(&t, &utc);
+#endif
+
+    const int year = utc.tm_year + 1900;
+    const int month = utc.tm_mon + 1;
+    const int day = utc.tm_mday;
+    const int secondsToday = utc.tm_hour * 3600 + utc.tm_min * 60 + utc.tm_sec;
+    const int hintSeconds = std::max(0, secondsToday - minutesBack * 60);
+    const int hintHour = hintSeconds / 3600;
+    const int hintMinute = (hintSeconds % 3600) / 60;
+    const int hintSecond = hintSeconds % 60;
+    std::string listPath = buildListUrl(station, year, month, day);
+    char keyBuf[128];
+    std::snprintf(keyBuf, sizeof(keyBuf),
+                  "%s%s%04d%02d%02d_%02d%02d%02d",
+                  listPath.data() + 1,
+                  station.c_str(),
+                  year, month, day,
+                  hintHour, hintMinute, hintSecond);
+
+    std::string query = "/?list-type=2&prefix=" + std::string(listPath.data() + 1);
+    query += "&start-after=" + std::string(keyBuf);
+    query += "&max-keys=" + std::to_string(std::max(2, maxKeys));
+    return query;
+}
+
+std::string trimCopy(std::string text) {
+    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!text.empty() && isSpace((unsigned char)text.front()))
+        text.erase(text.begin());
+    while (!text.empty() && isSpace((unsigned char)text.back()))
+        text.pop_back();
+    return text;
+}
+
+std::string normalizeStationCode(std::string station) {
+    station = trimCopy(std::move(station));
+    std::transform(station.begin(), station.end(), station.begin(),
+                   [](unsigned char c) { return (char)std::toupper(c); });
+    return station;
+}
+
+uint64_t fnv1aAppend(uint64_t hash, const void* data, size_t len) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= uint64_t(bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t fnv1aAppendString(uint64_t hash, const std::string& value) {
+    hash = fnv1aAppend(hash, value.data(), value.size());
+    const uint8_t terminator = 0xff;
+    return fnv1aAppend(hash, &terminator, 1);
+}
+
+uint64_t fnv1aAppendFloat(uint64_t hash, float value) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return fnv1aAppend(hash, &bits, sizeof(bits));
+}
+
+uint64_t computeWarningSignature(const std::vector<WarningPolygon>& warnings,
+                                 const WarningRenderOptions& options) {
+    uint64_t hash = 1469598103934665603ull;
+    const uint8_t enabled = options.enabled ? 1 : 0;
+    hash = fnv1aAppend(hash, &enabled, sizeof(enabled));
+    if (!options.enabled) return hash;
+
+    hash = fnv1aAppendFloat(hash, options.outlineScale);
+    hash = fnv1aAppendFloat(hash, options.fillOpacity);
+    hash = fnv1aAppend(hash, &options.watchColor, sizeof(options.watchColor));
+    hash = fnv1aAppend(hash, &options.tornadoColor, sizeof(options.tornadoColor));
+    hash = fnv1aAppend(hash, &options.severeColor, sizeof(options.severeColor));
+
+    for (const auto& warning : warnings) {
+        hash = fnv1aAppendString(hash, warning.id);
+        hash = fnv1aAppendString(hash, warning.event);
+        hash = fnv1aAppend(hash, &warning.color, sizeof(warning.color));
+        hash = fnv1aAppendFloat(hash, warning.line_width);
+        const uint32_t count = (uint32_t)warning.lats.size();
+        hash = fnv1aAppend(hash, &count, sizeof(count));
+        for (size_t i = 0; i < warning.lats.size(); ++i) {
+            hash = fnv1aAppendFloat(hash, warning.lats[i]);
+            hash = fnv1aAppendFloat(hash, warning.lons[i]);
+        }
+    }
+    return hash;
+}
+
+void plotOverlayPixel(uint32_t* pixels, int width, int height, int x, int y, uint32_t color, int radius = 0) {
+    for (int yy = y - radius; yy <= y + radius; ++yy) {
+        if (yy < 0 || yy >= height) continue;
+        for (int xx = x - radius; xx <= x + radius; ++xx) {
+            if (xx < 0 || xx >= width) continue;
+            pixels[(size_t)yy * width + xx] = color;
+        }
+    }
+}
+
+void drawOverlayLine(uint32_t* pixels, int width, int height,
+                     int x1, int y1, int x2, int y2,
+                     uint32_t color, int thickness) {
+    const int radius = std::max(0, thickness / 2);
+    int dx = abs(x2 - x1), dy = abs(y2 - y1);
+    int sx = x1 < x2 ? 1 : -1;
+    int sy = y1 < y2 ? 1 : -1;
+    int err = dx - dy;
+    const int maxSteps = dx + dy + 1;
+    int steps = 0;
+    while (steps++ < maxSteps) {
+        plotOverlayPixel(pixels, width, height, x1, y1, color, radius);
+        if (x1 == x2 && y1 == y2) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x1 += sx; }
+        if (e2 < dx) { err += dx; y1 += sy; }
+    }
+}
+
+int findStationIndexByCode(const std::string& station) {
+    for (int i = 0; i < NUM_NEXRAD_STATIONS; i++) {
+        if (station == NEXRAD_STATIONS[i].icao)
+            return i;
+    }
+    return -1;
+}
+
+std::string makeArchiveRangeLabel(const std::string& station,
+                                  int year, int month, int day,
+                                  int startHour, int startMin,
+                                  int endHour, int endMin) {
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer),
+                  "Archive %04d-%02d-%02d %02d:%02d-%02d:%02d UTC",
+                  year, month, day,
+                  startHour, startMin, endHour, endMin);
+    return buffer;
+}
+
+int findLowestSweepIndex(const std::vector<PrecomputedSweep>& sweeps) {
+    int bestIdx = -1;
+    float bestElev = std::numeric_limits<float>::max();
+    int bestProducts = -1;
+    int bestRadials = -1;
+
+    for (int i = 0; i < (int)sweeps.size(); i++) {
+        const auto& sw = sweeps[i];
+        if (sw.num_radials <= 0) continue;
+
+        int productCount = 0;
+        for (int p = 0; p < NUM_PRODUCTS; p++)
+            productCount += sw.products[p].has_data ? 1 : 0;
+
+        if (bestIdx < 0 ||
+            sw.elevation_angle < bestElev - 0.05f ||
+            (fabsf(sw.elevation_angle - bestElev) <= 0.05f && productCount > bestProducts) ||
+            (fabsf(sw.elevation_angle - bestElev) <= 0.05f && productCount == bestProducts &&
+             sw.num_radials > bestRadials)) {
+            bestIdx = i;
+            bestElev = sw.elevation_angle;
+            bestProducts = productCount;
+            bestRadials = sw.num_radials;
+        }
+    }
+
+    return bestIdx;
+}
+
+PrecomputedSweep buildPrecomputedSweep(const ParsedSweep& sweep) {
+    PrecomputedSweep pc;
+    pc.elevation_angle = sweep.elevation_angle;
+    pc.num_radials = (int)sweep.radials.size();
+    if (pc.num_radials == 0)
+        return pc;
+
+    pc.azimuths.resize(pc.num_radials);
+    for (int r = 0; r < pc.num_radials; r++)
+        pc.azimuths[r] = sweep.radials[r].azimuth;
+
+    for (const auto& radial : sweep.radials) {
+        for (const auto& moment : radial.moments) {
+            int p = moment.product_index;
+            if (p < 0 || p >= NUM_PRODUCTS) continue;
+            auto& pd = pc.products[p];
+            if (!pd.has_data || moment.num_gates > pd.num_gates) {
+                pd.has_data = true;
+                pd.num_gates = moment.num_gates;
+                pd.first_gate_km = moment.first_gate_m / 1000.0f;
+                pd.gate_spacing_km = moment.gate_spacing_m / 1000.0f;
+                pd.scale = moment.scale;
+                pd.offset = moment.offset;
+            }
+        }
+    }
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        auto& pd = pc.products[p];
+        if (!pd.has_data || pd.num_gates <= 0) continue;
+
+        int ng = pd.num_gates;
+        int nr = pc.num_radials;
+        pd.gates.assign((size_t)ng * nr, 0);
+
+        for (int r = 0; r < nr; r++) {
+            for (const auto& mom : sweep.radials[r].moments) {
+                if (mom.product_index != p) continue;
+                int gc = std::min((int)mom.gates.size(), ng);
+                for (int g = 0; g < gc; g++)
+                    pd.gates[(size_t)g * nr + r] = mom.gates[g];
+                break;
+            }
+        }
+    }
+
+    return pc;
+}
+
+std::vector<PrecomputedSweep> buildPrecomputedSweeps(const ParsedRadarData& parsed) {
+    std::vector<PrecomputedSweep> precomp;
+    precomp.resize(parsed.sweeps.size());
+    for (int si = 0; si < (int)parsed.sweeps.size(); si++)
+        precomp[si] = buildPrecomputedSweep(parsed.sweeps[si]);
+    return precomp;
+}
+
+void dealiasPrecomputedSweeps(std::vector<PrecomputedSweep>& sweeps) {
+    for (auto& pc : sweeps) {
+        auto& velPd = pc.products[PROD_VEL];
+        if (!velPd.has_data || velPd.num_gates == 0) continue;
+
+        const int nr = pc.num_radials;
+        const int ng = velPd.num_gates;
+        const float vn = 30.0f;
+
+        for (int ri = 0; ri < nr; ri++) {
+            float prevVel = -999.0f;
+            for (int gi = 1; gi < ng; gi++) {
+                uint16_t raw = velPd.gates[(size_t)gi * nr + ri];
+                if (raw <= 1) { prevVel = -999.0f; continue; }
+                float vel = ((float)raw - velPd.offset) / velPd.scale;
+
+                if (prevVel > -998.0f) {
+                    float diff = vel - prevVel;
+                    if (diff > vn) {
+                        vel -= 2.0f * vn;
+                        velPd.gates[(size_t)gi * nr + ri] = (uint16_t)(vel * velPd.scale + velPd.offset);
+                    } else if (diff < -vn) {
+                        vel += 2.0f * vn;
+                        velPd.gates[(size_t)gi * nr + ri] = (uint16_t)(vel * velPd.scale + velPd.offset);
+                    }
+                }
+                prevVel = vel;
+            }
+        }
+
+        for (int gi = 0; gi < ng; gi++) {
+            for (int ri = 0; ri < nr; ri++) {
+                uint16_t raw = velPd.gates[(size_t)gi * nr + ri];
+                if (raw <= 1) continue;
+                float vel = ((float)raw - velPd.offset) / velPd.scale;
+
+                int riPrev = (ri - 1 + nr) % nr;
+                int riNext = (ri + 1) % nr;
+                uint16_t rp = velPd.gates[(size_t)gi * nr + riPrev];
+                uint16_t rn = velPd.gates[(size_t)gi * nr + riNext];
+                if (rp <= 1 || rn <= 1) continue;
+                float vp = ((float)rp - velPd.offset) / velPd.scale;
+                float vnn = ((float)rn - velPd.offset) / velPd.scale;
+                float avg = (vp + vnn) * 0.5f;
+
+                float diff = vel - avg;
+                if (diff > vn) {
+                    vel -= 2.0f * vn;
+                    velPd.gates[(size_t)gi * nr + ri] = (uint16_t)(vel * velPd.scale + velPd.offset);
+                } else if (diff < -vn) {
+                    vel += 2.0f * vn;
+                    velPd.gates[(size_t)gi * nr + ri] = (uint16_t)(vel * velPd.scale + velPd.offset);
+                }
+            }
+        }
+    }
+}
+
+float decodeGateValue(const PrecomputedSweep::ProductData& pd, int num_radials,
+                      int gate_idx, int radial_idx) {
+    if (!pd.has_data || num_radials <= 0 ||
+        gate_idx < 0 || radial_idx < 0 ||
+        gate_idx >= pd.num_gates || radial_idx >= num_radials ||
+        pd.gates.empty()) {
+        return kInvalidSample;
+    }
+
+    uint16_t raw = pd.gates[(size_t)gate_idx * num_radials + radial_idx];
+    if (raw <= 1) return kInvalidSample;
+    return ((float)raw - pd.offset) / pd.scale;
+}
+
+int gateIndexForRange(const PrecomputedSweep::ProductData& pd, float range_km) {
+    if (!pd.has_data || pd.gate_spacing_km <= 0.0f) return -1;
+    int gate_idx = (int)((range_km - pd.first_gate_km) / pd.gate_spacing_km);
+    return (gate_idx >= 0 && gate_idx < pd.num_gates) ? gate_idx : -1;
+}
+
+float markerDistanceKm(float lat1, float lon1, float lat2, float lon2) {
+    float mean_lat = 0.5f * (lat1 + lat2) * kDegToRad;
+    float dlat_km = (lat1 - lat2) * 111.0f;
+    float dlon_km = (lon1 - lon2) * 111.0f * cosf(mean_lat);
+    return sqrtf(dlat_km * dlat_km + dlon_km * dlon_km);
+}
+
+int countCandidateSupport(const std::vector<uint8_t>& mask,
+                         int nr, int ng,
+                         int ri, int gi,
+                         int radial_radius, int gate_radius) {
+    int support = 0;
+    for (int dgi = -gate_radius; dgi <= gate_radius; ++dgi) {
+        int ngi = gi + dgi;
+        if (ngi < 0 || ngi >= ng) continue;
+        for (int dri = -radial_radius; dri <= radial_radius; ++dri) {
+            int nri = (ri + dri + nr) % nr;
+            support += mask[(size_t)ngi * nr + nri] ? 1 : 0;
+        }
+    }
+    return support;
+}
+
+bool isLocalExtremum(const std::vector<float>& score,
+                    const std::vector<uint8_t>& mask,
+                    int nr, int ng,
+                    int ri, int gi,
+                    int radial_radius, int gate_radius,
+                    bool lower_is_better) {
+    const float center = score[(size_t)gi * nr + ri];
+    for (int dgi = -gate_radius; dgi <= gate_radius; ++dgi) {
+        int ngi = gi + dgi;
+        if (ngi < 0 || ngi >= ng) continue;
+        for (int dri = -radial_radius; dri <= radial_radius; ++dri) {
+            int nri = (ri + dri + nr) % nr;
+            if (ngi == gi && nri == ri) continue;
+            if (!mask[(size_t)ngi * nr + nri]) continue;
+            float neighbor = score[(size_t)ngi * nr + nri];
+            if (lower_is_better) {
+                if (neighbor < center - 0.01f) return false;
+            } else {
+                if (neighbor > center + 0.01f) return false;
+            }
+        }
+    }
+    return true;
+}
+
+void clusterMarkers(std::vector<Detection::Marker>& markers,
+                    float merge_km, size_t max_markers,
+                    bool lower_value_is_stronger = false) {
+    if (markers.empty()) return;
+
+    std::sort(markers.begin(), markers.end(),
+              [lower_value_is_stronger](const Detection::Marker& a,
+                                        const Detection::Marker& b) {
+                  return lower_value_is_stronger ? (a.value < b.value)
+                                                 : (a.value > b.value);
+              });
+
+    std::vector<Detection::Marker> clustered;
+    clustered.reserve(std::min(markers.size(), max_markers));
+    for (const auto& marker : markers) {
+        bool keep = true;
+        for (const auto& existing : clustered) {
+            if (markerDistanceKm(marker.lat, marker.lon, existing.lat, existing.lon) < merge_km) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            clustered.push_back(marker);
+            if (clustered.size() >= max_markers) break;
+        }
+    }
+    markers.swap(clustered);
+}
+
+void clusterMesoMarkers(std::vector<Detection::MesoMarker>& markers,
+                        float merge_km, size_t max_markers) {
+    if (markers.empty()) return;
+
+    std::sort(markers.begin(), markers.end(),
+              [](const Detection::MesoMarker& a, const Detection::MesoMarker& b) {
+                  return a.shear > b.shear;
+              });
+
+    std::vector<Detection::MesoMarker> clustered;
+    clustered.reserve(std::min(markers.size(), max_markers));
+    for (const auto& marker : markers) {
+        bool keep = true;
+        for (const auto& existing : clustered) {
+            if (markerDistanceKm(marker.lat, marker.lon, existing.lat, existing.lon) < merge_km) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep) {
+            clustered.push_back(marker);
+            if (clustered.size() >= max_markers) break;
+        }
+    }
+    markers.swap(clustered);
+}
+
+void suppressReflectivityRingArtifacts(std::vector<PrecomputedSweep>& sweeps) {
+    constexpr float kCoverageStrong = 0.95f;
+    constexpr float kCoverageLoose = 0.88f;
+    constexpr float kStdStrong = 12.0f;
+    constexpr float kStdLoose = 6.0f;
+    constexpr float kMaxRangeKm = 160.0f;
+
+    for (auto& sweep : sweeps) {
+        auto& pd = sweep.products[PROD_REF];
+        if (!pd.has_data || pd.num_gates <= 0 || sweep.num_radials < 300 || pd.gates.empty())
+            continue;
+
+        const int nr = sweep.num_radials;
+        const int ng = pd.num_gates;
+        std::vector<uint8_t> suppressGate((size_t)ng, 0);
+
+        for (int gi = 0; gi < ng; ++gi) {
+            const float range_km = pd.first_gate_km + gi * pd.gate_spacing_km;
+            if (range_km > kMaxRangeKm) break;
+
+            int valid = 0;
+            float sum = 0.0f;
+            float sum2 = 0.0f;
+            for (int ri = 0; ri < nr; ++ri) {
+                uint16_t raw = pd.gates[(size_t)gi * nr + ri];
+                if (raw <= 1) continue;
+                float value = ((float)raw - pd.offset) / pd.scale;
+                valid++;
+                sum += value;
+                sum2 += value * value;
+            }
+
+            if (valid < nr / 2) continue;
+
+            const float coverage = (float)valid / (float)nr;
+            const float mean = sum / (float)valid;
+            const float variance = fmaxf(sum2 / (float)valid - mean * mean, 0.0f);
+            const float stddev = sqrtf(variance);
+
+            const bool strongRing = coverage >= kCoverageStrong && mean >= 10.0f && stddev <= kStdStrong;
+            const bool looseRing = coverage >= kCoverageLoose && mean >= 20.0f && stddev <= kStdLoose;
+            if (strongRing || looseRing)
+                suppressGate[gi] = 1;
+        }
+
+        for (int gi = 0; gi < ng; ++gi) {
+            if (!suppressGate[(size_t)gi]) continue;
+            for (int ri = 0; ri < nr; ++ri)
+                pd.gates[(size_t)gi * nr + ri] = 0;
+        }
+    }
+}
+
+} // namespace
+
+App::App()
+    : m_spatialGrid(std::make_unique<SpatialGrid>()) {}
+
+App::~App() {
+    // Stop all background work first (joins download threads so no callbacks fire)
+    if (m_downloader) m_downloader->shutdown();
+    if (m_liveLoopDownloader) m_liveLoopDownloader->shutdown();
+    m_historic.cancel();
+    m_warnings.stop();
+
+    // Wait for any in-flight GPU work to finish
+    if (m_renderer) m_renderer->waitForGpu();
+
+    invalidateLiveLoop(true);
+    invalidateFrameCache(true);
+    m_d_xsOutput = nil;
+    m_d_compositeOutput = nil;
+    if (m_renderer) {
+        m_renderer->freeVolume();
+        m_renderer->shutdown();
+    }
+    m_xsTex.destroy();
+    m_outputTex.destroy();
+}
+
+bool App::init(int windowWidth, int windowHeight) {
+    m_windowWidth = windowWidth;
+    m_windowHeight = windowHeight;
+
+    // Initialize Metal renderer
+    m_renderer = std::make_unique<MetalRenderer>();
+    if (!m_renderer->init()) {
+        fprintf(stderr, "Failed to initialize Metal renderer\n");
+        return false;
+    }
+
+    // Allocate compositor output buffer
+    size_t outSize = (size_t)windowWidth * windowHeight * sizeof(uint32_t);
+    m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
+    memset(m_d_compositeOutput.contents, 0, outSize);
+
+    // Create Metal textures for display
+    if (!m_outputTex.init(windowWidth, windowHeight, m_renderer->getDevice())) {
+        fprintf(stderr, "Failed to create output texture\n");
+        return false;
+    }
+    // Cross-section texture (small initial size, resized on demand)
+    m_xsTex.init(windowWidth, std::max(200, windowHeight / 3), m_renderer->getDevice());
+
+    // Set up viewport centered on CONUS
+    m_viewport.center_lat = 39.0;
+    m_viewport.center_lon = -98.0;
+    m_viewport.zoom = 28.0; // pixels per degree - shows full CONUS
+    m_viewport.width = windowWidth;
+    m_viewport.height = windowHeight;
+
+    // Initialize station states
+    m_stationsTotal = NUM_NEXRAD_STATIONS;
+    m_stations.resize(m_stationsTotal);
+    for (int i = 0; i < m_stationsTotal; i++) {
+        auto& s = m_stations[i];
+        s.index = i;
+        s.icao = NEXRAD_STATIONS[i].icao;
+        s.lat = NEXRAD_STATIONS[i].lat;
+        s.lon = NEXRAD_STATIONS[i].lon;
+    }
+
+    // Create downloader with 48 concurrent threads
+    m_downloader = std::make_unique<Downloader>(48);
+    m_liveLoopDownloader = std::make_unique<Downloader>(2);
+
+    // Start downloading all stations
+    startDownloads();
+
+    m_renderer->initVolume();
+    m_warnings.startPolling();
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_lastLivePollSweep = m_lastRefresh;
+
+    printf("App initialized: %d stations, viewport %dx%d\n",
+           m_stationsTotal, windowWidth, windowHeight);
+    fflush(stderr);
+    return true;
+}
+
+bool App::init(int windowWidth, int windowHeight, id<MTLDevice> device) {
+    m_windowWidth = windowWidth;
+    m_windowHeight = windowHeight;
+
+    // Initialize Metal renderer with external device
+    m_renderer = std::make_unique<MetalRenderer>();
+    if (!m_renderer->init(device)) {
+        fprintf(stderr, "Failed to initialize Metal renderer with external device\n");
+        return false;
+    }
+
+    // Allocate compositor output buffer
+    size_t outSize = (size_t)windowWidth * windowHeight * sizeof(uint32_t);
+    m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
+    memset(m_d_compositeOutput.contents, 0, outSize);
+
+    // Create Metal textures for display
+    if (!m_outputTex.init(windowWidth, windowHeight, m_renderer->getDevice())) {
+        fprintf(stderr, "Failed to create output texture\n");
+        return false;
+    }
+    m_xsTex.init(windowWidth, std::max(200, windowHeight / 3), m_renderer->getDevice());
+
+    // Set up viewport centered on CONUS
+    m_viewport.center_lat = 39.0;
+    m_viewport.center_lon = -98.0;
+    m_viewport.zoom = 28.0;
+    m_viewport.width = windowWidth;
+    m_viewport.height = windowHeight;
+
+    // Initialize station states
+    m_stationsTotal = NUM_NEXRAD_STATIONS;
+    m_stations.resize(m_stationsTotal);
+    for (int i = 0; i < m_stationsTotal; i++) {
+        auto& s = m_stations[i];
+        s.index = i;
+        s.icao = NEXRAD_STATIONS[i].icao;
+        s.lat = NEXRAD_STATIONS[i].lat;
+        s.lon = NEXRAD_STATIONS[i].lon;
+    }
+
+    // iOS: reduced resources
+    m_downloader = std::make_unique<Downloader>(6);
+    m_liveLoopDownloader = std::make_unique<Downloader>(2);
+
+    // iOS: only download nearest station to viewport center, not all 162
+    // Find nearest station
+    float bestDist = 1e9f;
+    int bestIdx = 0;
+    for (int i = 0; i < m_stationsTotal; i++) {
+        float dlat = m_stations[i].lat - (float)m_viewport.center_lat;
+        float dlon = m_stations[i].lon - (float)m_viewport.center_lon;
+        float dist = dlat * dlat + dlon * dlon;
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+    }
+    m_activeStationIdx = bestIdx;
+    m_singleStationMode = true;  // iOS: only poll active station
+    m_viewport.center_lat = m_stations[bestIdx].lat;
+    m_viewport.center_lon = m_stations[bestIdx].lon;
+    m_viewport.zoom = 180.0;
+
+    // Download just this one station
+    queueLiveStationRefresh(bestIdx, true);
+    printf("iOS: downloading nearest station %s\n", m_stations[bestIdx].icao.c_str());
+
+    // Skip volume init on iOS (saves 48MB)
+    // m_renderer->initVolume();
+    m_warnings.startPolling();
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_lastLivePollSweep = m_lastRefresh;
+
+    printf("App initialized (iOS): station %s, viewport %dx%d\n",
+           m_stations[bestIdx].icao.c_str(), windowWidth, windowHeight);
+    return true;
+}
+
+bool App::isCurrentDownloadGeneration(uint64_t generation) const {
+    return generation == m_downloadGeneration.load();
+}
+
+void App::failDownload(int stationIdx, uint64_t generation, std::string error) {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    if (!isCurrentDownloadGeneration(generation)) return;
+    if (stationIdx < 0 || stationIdx >= (int)m_stations.size()) return;
+
+    auto& st = m_stations[stationIdx];
+    st.failed = true;
+    st.error = std::move(error);
+    if (st.downloading) {
+        st.downloading = false;
+        m_stationsDownloading--;
+    }
+}
+
+void App::finishLivePollNoChange(int stationIdx, uint64_t generation) {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    if (!isCurrentDownloadGeneration(generation)) return;
+    if (stationIdx < 0 || stationIdx >= (int)m_stations.size()) return;
+
+    auto& st = m_stations[stationIdx];
+    st.failed = false;
+    st.error.clear();
+    if (st.downloading) {
+        st.downloading = false;
+        m_stationsDownloading--;
+    }
+}
+
+bool App::stationLikelyVisible(int stationIdx) const {
+    if (stationIdx < 0 || stationIdx >= m_stationsTotal || m_viewport.zoom <= 0.0)
+        return false;
+
+    const double halfLat = (double)m_viewport.height * 0.5 / m_viewport.zoom;
+    const double halfLon = (double)m_viewport.width * 0.5 / m_viewport.zoom;
+    const double marginLat = std::max(1.5, halfLat * 0.1);
+    const double marginLon = std::max(1.5, halfLon * 0.1);
+    const double lat = NEXRAD_STATIONS[stationIdx].lat;
+    const double lon = NEXRAD_STATIONS[stationIdx].lon;
+    return lat >= m_viewport.center_lat - halfLat - marginLat &&
+           lat <= m_viewport.center_lat + halfLat + marginLat &&
+           lon >= m_viewport.center_lon - halfLon - marginLon &&
+           lon <= m_viewport.center_lon + halfLon + marginLon;
+}
+
+float App::livePollIntervalSecForStation(int stationIdx, const StationState& st) const {
+    float base = m_backgroundStationPollIntervalSec;
+    const bool active = stationIdx == m_activeStationIdx;
+    const bool visible = stationLikelyVisible(stationIdx);
+
+    if (active) {
+        base = m_activeStationPollIntervalSec;
+    } else if (visible) {
+        base = m_visibleStationPollIntervalSec;
+    }
+
+    if (!st.parsed || st.failed)
+        base = std::min(base, m_recoveryStationPollIntervalSec);
+
+    if (!m_showAll && !active && visible)
+        base = std::min(base, 20.0f);
+
+    return base * stationPollJitter(stationIdx);
+}
+
+int App::stationLiveHistoryLimitLocked(int stationIdx) const {
+    if (m_snapshotMode || m_historicMode)
+        return 0;
+    if (stationIdx == m_activeStationIdx)
+        return MAX_LIVE_LOOP_FRAMES;
+    return m_singleStationMode ? 1 : 2;
+}
+
+void App::appendLiveHistoryLocked(StationState& st, const std::string& volumeKey,
+                                  const std::vector<PrecomputedSweep>& sweeps,
+                                  float stationLat, float stationLon) {
+    if (volumeKey.empty() || sweeps.empty())
+        return;
+
+    LiveVolumeHistoryEntry entry;
+    entry.volume_key = volumeKey;
+    entry.label = formatVolumeKeyTimestamp(volumeKey);
+    entry.sweeps = sweeps;
+    entry.station_lat = stationLat;
+    entry.station_lon = stationLon;
+
+    auto insertPos = st.live_history.begin();
+    while (insertPos != st.live_history.end() && insertPos->volume_key < volumeKey)
+        ++insertPos;
+    if (insertPos != st.live_history.end() && insertPos->volume_key == volumeKey)
+        return;
+    st.live_history.insert(insertPos, std::move(entry));
+}
+
+void App::trimLiveHistoryWorkingSet(int focusIdx) {
+    (void)focusIdx;
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    for (int i = 0; i < (int)m_stations.size(); i++) {
+        auto& st = m_stations[i];
+        const int limit = stationLiveHistoryLimitLocked(i);
+        while ((int)st.live_history.size() > limit)
+            st.live_history.pop_front();
+    }
+}
+
+void App::queueLiveStationRefresh(int stationIdx, bool force) {
+    if (stationIdx < 0 || stationIdx >= m_stationsTotal || m_snapshotMode || m_historicMode)
+        return;
+
+    const uint64_t generation = m_downloadGeneration.load();
+    const bool dealiasEnabled = m_dealias;
+    const auto now = std::chrono::steady_clock::now();
+    std::string station;
+    std::string currentKey;
+
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation)) return;
+        auto& st = m_stations[stationIdx];
+        if (st.downloading) return;
+
+        if (!force) {
+            const float elapsed = st.lastPollAttempt.time_since_epoch().count() == 0
+                ? std::numeric_limits<float>::max()
+                : std::chrono::duration<float>(now - st.lastPollAttempt).count();
+            if (elapsed < livePollIntervalSecForStation(stationIdx, st))
+                return;
+        }
+
+        st.downloading = true;
+        st.failed = false;
+        st.error.clear();
+        st.lastPollAttempt = now;
+        station = st.icao;
+        currentKey = st.latestVolumeKey;
+    }
+    m_stationsDownloading++;
+
+    int year, month, day;
+    getUtcDate(year, month, day);
+    const bool initialTailQuery = currentKey.empty();
+    const std::string listQuery = initialTailQuery
+        ? buildRecentLiveTailQuery(station)
+        : buildLiveListQuery(station, year, month, day, currentKey);
+
+    m_downloader->queueDownload(
+        station + "_live_list",
+        NEXRAD_HOST,
+        listQuery,
+        [this, stationIdx, station, generation, dealiasEnabled, currentKey, initialTailQuery](const std::string& id, DownloadResult listResult) {
+            if (!isCurrentDownloadGeneration(generation)) return;
+            if (!listResult.success || listResult.data.empty()) {
+                if (!currentKey.empty()) {
+                    finishLivePollNoChange(stationIdx, generation);
+                    return;
+                }
+
+                int y, m, d;
+                getUtcDate(y, m, d);
+                shiftDate(y, m, d, -1);
+
+                std::string path2 = buildLiveListQuery(station, y, m, d, {});
+
+                auto retry = Downloader::httpGet(NEXRAD_HOST, path2);
+                if (!retry.success || retry.data.empty()) {
+                    failDownload(stationIdx, generation, "No data available");
+                    return;
+                }
+                listResult = std::move(retry);
+            }
+
+            if (!isCurrentDownloadGeneration(generation)) return;
+
+            std::string xml(listResult.data.begin(), listResult.data.end());
+            auto files = parseS3ListResponse(xml);
+            if (files.empty()) {
+                if (initialTailQuery) {
+                    int y, m, d;
+                    getUtcDate(y, m, d);
+                    auto retry = Downloader::httpGet(NEXRAD_HOST, buildLiveListQuery(station, y, m, d, {}));
+                    if (retry.success && !retry.data.empty()) {
+                        xml.assign(retry.data.begin(), retry.data.end());
+                        files = parseS3ListResponse(xml);
+                    }
+                }
+                if (!currentKey.empty()) {
+                    finishLivePollNoChange(stationIdx, generation);
+                    return;
+                }
+                if (files.empty())
+                    failDownload(stationIdx, generation, "No files found");
+                return;
+            }
+
+            std::vector<std::string> candidates;
+            const std::string& latestKey = files.back().key;
+            if (currentKey.empty() || latestKey > currentKey)
+                candidates.push_back(latestKey);
+
+            if (files.size() >= 2) {
+                const std::string& fallbackKey = files[files.size() - 2].key;
+                if ((currentKey.empty() || fallbackKey > currentKey) &&
+                    fallbackKey != latestKey) {
+                    candidates.push_back(fallbackKey);
+                }
+            }
+
+            if (candidates.empty()) {
+                finishLivePollNoChange(stationIdx, generation);
+                return;
+            }
+
+            std::string lastError = "Latest scan unavailable";
+            for (const auto& fileKey : candidates) {
+                if (!isCurrentDownloadGeneration(generation)) return;
+                auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + fileKey);
+                if (!fileResult.success || fileResult.data.empty()) {
+                    if (!fileResult.error.empty())
+                        lastError = fileResult.error;
+                    continue;
+                }
+                if (tryProcessDownload(stationIdx, std::move(fileResult.data), generation,
+                                       false, false, dealiasEnabled, fileKey)) {
+                    return;
+                }
+                lastError = "Parse failed: no sweeps";
+            }
+
+            if (!currentKey.empty()) {
+                finishLivePollNoChange(stationIdx, generation);
+                return;
+            }
+            failDownload(stationIdx, generation, lastError);
+        }
+    );
+}
+
+void App::startDownloads() {
+    if (m_singleStationMode && m_activeStationIdx >= 0) {
+        printf("Single-station mode: refreshing %s only\n", m_stations[m_activeStationIdx].icao.c_str());
+        queueLiveStationRefresh(m_activeStationIdx, true);
+        return;
+    }
+    int year, month, day;
+    getUtcDate(year, month, day);
+    printf("Fetching latest data for %04d-%02d-%02d from %d stations...\n",
+           year, month, day, m_stationsTotal);
+    for (int i = 0; i < m_stationsTotal; i++)
+        queueLiveStationRefresh(i, true);
+}
+
+void App::resetStationsForReload() {
+    if (m_downloader) m_downloader->shutdown();
+    if (m_liveLoopDownloader) m_liveLoopDownloader->shutdown();
+    m_downloader = std::make_unique<Downloader>(48);
+    m_liveLoopDownloader = std::make_unique<Downloader>(2);
+    invalidateLiveLoop(true);
+
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        m_uploadQueue.clear();
+    }
+
+    for (int i = 0; i < (int)m_stations.size(); i++) {
+        m_renderer->freeStation(i);
+        auto& st = m_stations[i];
+        st.downloading = false;
+        st.parsed = false;
+        st.uploaded = false;
+        st.rendered = false;
+        st.failed = false;
+        st.error.clear();
+        st.raw_volume_data.clear();
+        st.gpuInfo = {};
+        st.precomputed.clear();
+        st.total_sweeps = 0;
+        st.lowest_sweep_elev = 0.0f;
+        st.lowest_sweep_radials = 0;
+        st.data_lat = 0.0f;
+        st.data_lon = 0.0f;
+        st.lastUpdate = {};
+        st.lastPollAttempt = {};
+        st.latestVolumeKey.clear();
+        st.detection = {};
+        st.timings = {};
+        st.live_history.clear();
+        st.uploaded_product = -1;
+        st.uploaded_tilt = -1;
+        st.uploaded_sweep = -1;
+        st.uploaded_lowest_sweep = false;
+    }
+
+    m_stationsLoaded = 0;
+    m_stationsDownloading = 0;
+    m_gridDirty = true;
+    m_activeStationIdx = -1;
+    m_allTiltsCached = false;
+    m_activeTilt = 0;
+    m_maxTilts = 1;
+    m_activeTiltAngle = 0.5f;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    m_lastHistoricFrame = -1;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::startDownloadsForTimestamp(int year, int month, int day, int hour, int minute) {
+    const uint64_t generation = m_downloadGeneration.load();
+    const bool snapshotMode = m_snapshotMode;
+    const bool lowestSweepOnly = m_snapshotLowestSweepOnly;
+    const bool dealiasEnabled = m_dealias;
+    const int targetSeconds = hour * 3600 + minute * 60;
+    if (snapshotMode) {
+        m_snapshotTimestampIso = makeIsoUtcTimestamp(year, month, day, hour, minute);
+        m_warnings.requestHistoricSnapshot(m_snapshotTimestampIso);
+    } else {
+        m_snapshotTimestampIso.clear();
+    }
+    printf("Fetching archive snapshot for %04d-%02d-%02d %02d:%02d UTC from %d stations...\n",
+           year, month, day, hour, minute, m_stationsTotal);
+
+    for (int i = 0; i < m_stationsTotal; i++) {
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            auto& st = m_stations[i];
+            if (st.downloading) continue;
+            st.downloading = true;
+            st.failed = false;
+            st.error.clear();
+        }
+        m_stationsDownloading++;
+
+        std::string station = m_stations[i].icao;
+        int idx = i;
+        std::string listPath = buildListUrl(station, year, month, day);
+
+        m_downloader->queueDownload(
+            station + "_archive_list",
+            NEXRAD_HOST,
+            "/?list-type=2&prefix=" + std::string(listPath.data() + 1) + "&max-keys=1000",
+            [this, idx, station, targetSeconds, generation, snapshotMode, lowestSweepOnly, dealiasEnabled](const std::string& id, DownloadResult listResult) {
+                if (!isCurrentDownloadGeneration(generation)) return;
+                if (!listResult.success || listResult.data.empty()) {
+                    failDownload(idx, generation, "Archive listing failed");
+                    return;
+                }
+
+                std::string xml(listResult.data.begin(), listResult.data.end());
+                auto files = parseS3ListResponse(xml);
+                if (files.empty()) {
+                    failDownload(idx, generation, "No archive files found");
+                    return;
+                }
+
+                int bestIdx = -1;
+                int bestDelta = std::numeric_limits<int>::max();
+                for (int fi = 0; fi < (int)files.size(); fi++) {
+                    int hh = 0, mm = 0, ss = 0;
+                    if (!extractArchiveTime(filenameFromKey(files[fi].key), hh, mm, ss))
+                        continue;
+                    int delta = abs((hh * 3600 + mm * 60 + ss) - targetSeconds);
+                    if (delta < bestDelta) {
+                        bestDelta = delta;
+                        bestIdx = fi;
+                    }
+                }
+
+                if (bestIdx < 0) {
+                    failDownload(idx, generation, "No timestamped archive volume");
+                    return;
+                }
+
+                if (!isCurrentDownloadGeneration(generation)) return;
+                auto fileResult = Downloader::httpGet(NEXRAD_HOST, "/" + files[bestIdx].key);
+                if (fileResult.success && !fileResult.data.empty()) {
+                    processDownload(idx, std::move(fileResult.data), generation,
+                                    snapshotMode, lowestSweepOnly, dealiasEnabled,
+                                    files[bestIdx].key);
+                } else {
+                    failDownload(idx, generation,
+                                 fileResult.error.empty() ? "Archive download failed"
+                                                           : fileResult.error);
+                }
+            }
+        );
+    }
+}
+
+bool App::tryProcessDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
+                             bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
+                             const std::string& volumeKey) {
+    if (!isCurrentDownloadGeneration(generation)) return false;
+    const std::string stationName = NEXRAD_STATIONS[stationIdx].icao;
+    PipelineStageTimings timings = {};
+
+    auto decodeStart = Clock::now();
+    std::vector<uint8_t> decoded = Level2Parser::decodeArchiveBytes(data);
+    timings.decode_ms = elapsedMs(decodeStart, Clock::now());
+    if (decoded.empty())
+        return false;
+
+    auto parseStart = Clock::now();
+    ParsedRadarData parsed = Level2Parser::parseDecodedMessages(decoded, stationName);
+    timings.parse_ms = elapsedMs(parseStart, Clock::now());
+    if (parsed.sweeps.empty())
+        return false;
+
+    auto buildStart = Clock::now();
+    std::vector<PrecomputedSweep> precomp = buildPrecomputedSweeps(parsed);
+    timings.sweep_build_ms = elapsedMs(buildStart, Clock::now());
+
+    if (snapshotMode && lowestSweepOnly) {
+        int lowestIdx = findLowestSweepIndex(precomp);
+        if (lowestIdx >= 0) {
+            std::vector<PrecomputedSweep> reducedPrecomp;
+            reducedPrecomp.push_back(std::move(precomp[lowestIdx]));
+            precomp.swap(reducedPrecomp);
+        }
+    }
+
+    auto preprocessStart = Clock::now();
+    if (dealiasEnabled)
+        dealiasPrecomputedSweeps(precomp);
+    if (snapshotMode)
+        suppressReflectivityRingArtifacts(precomp);
+    timings.preprocess_ms = elapsedMs(preprocessStart, Clock::now());
+
+    const int lowestIdx = findLowestSweepIndex(precomp);
+    const float dataLat = parsed.station_lat != 0.0f ? parsed.station_lat : NEXRAD_STATIONS[stationIdx].lat;
+    const float dataLon = parsed.station_lon != 0.0f ? parsed.station_lon : NEXRAD_STATIONS[stationIdx].lon;
+    const int totalSweeps = (int)parsed.sweeps.size();
+    const float lowestElev = lowestIdx >= 0 ? precomp[lowestIdx].elevation_angle : 0.0f;
+    const int lowestRadials = lowestIdx >= 0 ? precomp[lowestIdx].num_radials : 0;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (!isCurrentDownloadGeneration(generation)) return false;
+        m_stations[stationIdx].raw_volume_data = std::move(data);
+        m_stations[stationIdx].precomputed = std::move(precomp);
+        m_stations[stationIdx].total_sweeps = totalSweeps;
+        m_stations[stationIdx].lowest_sweep_elev = lowestElev;
+        m_stations[stationIdx].lowest_sweep_radials = lowestRadials;
+        m_stations[stationIdx].data_lat = dataLat;
+        m_stations[stationIdx].data_lon = dataLon;
+        m_stations[stationIdx].parsed = true;
+        m_stations[stationIdx].failed = false;
+        m_stations[stationIdx].error.clear();
+        if (m_stations[stationIdx].downloading) {
+            m_stations[stationIdx].downloading = false;
+            m_stationsDownloading--;
+        }
+        m_stations[stationIdx].lastUpdate = std::chrono::steady_clock::now();
+        m_stations[stationIdx].latestVolumeKey = volumeKey;
+        m_stations[stationIdx].timings = timings;
+
+        auto detectStart = Clock::now();
+        computeDetection(stationIdx);
+        m_stations[stationIdx].timings.detection_ms = elapsedMs(detectStart, Clock::now());
+        appendLiveHistoryLocked(m_stations[stationIdx], volumeKey,
+                                m_stations[stationIdx].precomputed,
+                                dataLat, dataLon);
+    }
+
+    trimLiveHistoryWorkingSet(stationIdx);
+
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        if (isCurrentDownloadGeneration(generation))
+            m_uploadQueue.push_back(stationIdx);
+    }
+    return true;
+}
+
+void App::processDownload(int stationIdx, std::vector<uint8_t> data, uint64_t generation,
+                          bool snapshotMode, bool lowestSweepOnly, bool dealiasEnabled,
+                          const std::string& volumeKey) {
+    if (!tryProcessDownload(stationIdx, std::move(data), generation,
+                            snapshotMode, lowestSweepOnly, dealiasEnabled, volumeKey)) {
+        failDownload(stationIdx, generation, "Parse failed: no sweeps");
+    }
+}
+
+// Build a list of "best" sweep indices for a product:
+// At each unique elevation, keep only the sweep with the most gates.
+// This deduplicates split-cut sweeps and removes junk tilts.
+static std::vector<int> getBestSweeps(const std::vector<PrecomputedSweep>& sweeps, int product) {
+    // Collect all sweeps that have this product, grouped by elevation
+    struct ElevEntry { int sweepIdx; float elev; int gates; };
+    std::vector<ElevEntry> candidates;
+    for (int i = 0; i < (int)sweeps.size(); i++) {
+        if (sweeps[i].products[product].has_data && sweeps[i].num_radials > 0) {
+            candidates.push_back({i, sweeps[i].elevation_angle,
+                                   sweeps[i].products[product].num_gates});
+        }
+    }
+
+    // For each unique elevation (within 0.3 deg), keep the one with most gates
+    std::vector<int> best;
+    for (auto& c : candidates) {
+        bool dominated = false;
+        for (auto& b : best) {
+            float de = fabsf(sweeps[b].elevation_angle - c.elev);
+            if (de < 0.3f) {
+                // Same elevation - keep the one with more gates
+                if (c.gates > sweeps[b].products[product].num_gates) {
+                    b = c.sweepIdx; // replace with better one
+                }
+                dominated = true;
+                break;
+            }
+        }
+        if (!dominated) {
+            best.push_back(c.sweepIdx);
+        }
+    }
+
+    std::sort(best.begin(), best.end(),
+              [&sweeps](int a, int b) {
+                  return sweeps[a].elevation_angle < sweeps[b].elevation_angle;
+              });
+    return best;
+}
+
+static int findProductSweep(const std::vector<PrecomputedSweep>& sweeps, int product, int tiltIdx) {
+    auto best = getBestSweeps(sweeps, product);
+    if (best.empty()) return 0;
+    if (tiltIdx < 0) tiltIdx = 0;
+    if (tiltIdx >= (int)best.size()) tiltIdx = (int)best.size() - 1;
+    return best[tiltIdx];
+}
+
+static int countProductSweeps(const std::vector<PrecomputedSweep>& sweeps, int product) {
+    return (int)getBestSweeps(sweeps, product).size();
+}
+
+std::vector<StationUiState> App::stations() const {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    std::vector<StationUiState> snapshot;
+    snapshot.reserve(m_stations.size());
+    for (const auto& st : m_stations) {
+        StationUiState ui = {};
+        ui.index = st.index;
+        ui.icao = st.icao;
+        ui.lat = st.lat;
+        ui.lon = st.lon;
+        ui.display_lat = st.gpuInfo.lat != 0.0f ? st.gpuInfo.lat : st.lat;
+        ui.display_lon = st.gpuInfo.lon != 0.0f ? st.gpuInfo.lon : st.lon;
+        ui.latest_scan_utc = formatVolumeKeyTimestamp(st.latestVolumeKey);
+        ui.downloading = st.downloading;
+        ui.parsed = st.parsed;
+        ui.uploaded = st.uploaded;
+        ui.rendered = st.rendered;
+        ui.failed = st.failed;
+        ui.error = st.error;
+        ui.sweep_count = st.total_sweeps > 0 ? st.total_sweeps : (int)st.precomputed.size();
+        ui.lowest_elev = st.lowest_sweep_elev;
+        ui.lowest_radials = st.lowest_sweep_radials;
+        ui.detection = st.detection;
+        ui.timings = st.timings;
+        snapshot.push_back(std::move(ui));
+    }
+    return snapshot;
+}
+
+std::vector<WarningPolygon> App::currentWarnings() const {
+    std::vector<WarningPolygon> source;
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (fr && !fr->valid_time_iso.empty())
+            source = m_warnings.getHistoricWarnings(fr->valid_time_iso);
+    } else if (m_snapshotMode && !m_snapshotTimestampIso.empty()) {
+        source = m_warnings.getHistoricWarnings(m_snapshotTimestampIso);
+    } else {
+        source = m_warnings.getWarnings();
+    }
+
+    std::vector<WarningPolygon> filtered;
+    filtered.reserve(source.size());
+    for (auto& warning : source) {
+        if (!m_warningOptions.allows(warning)) continue;
+        warning.color = m_warningOptions.resolvedColor(warning);
+        warning.line_width = m_warningOptions.resolvedLineWidth(warning);
+        filtered.push_back(std::move(warning));
+    }
+    return filtered;
+}
+
+void App::refreshWarningOverlayState() {
+    const uint64_t signature = computeWarningSignature(currentWarnings(), m_warningOptions);
+    if (signature != m_warningOverlaySignature) {
+        m_warningOverlaySignature = signature;
+        m_needsRerender = true;
+        m_needsComposite = true;
+    }
+}
+
+bool App::loadColorTableFromFile(const std::string& path) {
+    ParsedColorTable table;
+    std::string error;
+    if (!loadColorTableFile(path, table, error)) {
+        m_colorTableStatus = "Palette load failed: " + error;
+        return false;
+    }
+
+    m_renderer->setColorTable(table.product, table.colors.data());
+    m_colorTableLabels[table.product] = table.label;
+    m_colorTableStatus = table.format + " loaded for " + PRODUCT_INFO[table.product].name +
+        " from " + table.label;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+    return true;
+}
+
+void App::resetColorTable(int product) {
+    if (product < 0 || product >= NUM_PRODUCTS)
+        product = m_activeProduct;
+    m_renderer->resetColorTable(product);
+    m_colorTableLabels[product].clear();
+    m_colorTableStatus = std::string("Reset ") + PRODUCT_INFO[product].name + " to built-in palette";
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+}
+
+bool App::stationUploadMatchesSelection(const StationState& st) const {
+    const bool lowestSweepUpload = m_showAll || m_snapshotMode;
+    if (!st.uploaded ||
+        st.uploaded_product != m_activeProduct ||
+        st.uploaded_lowest_sweep != lowestSweepUpload) {
+        return false;
+    }
+
+    return lowestSweepUpload || st.uploaded_tilt == m_activeTilt;
+}
+
+void App::invalidateFrameCache(bool freeMemory) {
+    if (freeMemory) {
+        for (auto& frame : m_cachedFrames) {
+            if (frame) {
+                frame = nil;
+            }
+        }
+    }
+    m_cachedFrameCount = 0;
+    m_cachedFrameWidth = 0;
+    m_cachedFrameHeight = 0;
+}
+
+void App::ensureCrossSectionBuffer(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    if (m_d_xsOutput &&
+        width == m_xsAllocWidth &&
+        height == m_xsAllocHeight) {
+        return;
+    }
+
+    m_d_xsOutput = nil;
+
+    m_d_xsOutput = [m_renderer->getDevice() newBufferWithLength:(size_t)width * height * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    m_xsAllocWidth = width;
+    m_xsAllocHeight = height;
+}
+
+void App::rebuildVolumeForCurrentSelection() {
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+
+    auto buildVolumeFromSweeps = [&](const std::vector<PrecomputedSweep>& sweeps,
+                                     float slat, float slon, int stationSlot) {
+        int ns = (int)sweeps.size();
+        if (ns <= 0) return;
+
+        std::vector<GpuStationInfo> sweepInfos(ns);
+        std::vector<id<MTLBuffer> __unsafe_unretained> azPtrs(ns);
+        std::vector<id<MTLBuffer> __unsafe_unretained> gatePtrs(ns);
+
+        int builtSweeps = 0;
+        for (int s = 0; s < ns && s < 32; s++) {
+            const auto& pc = sweeps[s];
+            int slot = 200 + s;
+            if (slot >= MAX_STATIONS || pc.num_radials <= 0) break;
+
+            GpuStationInfo info = {};
+            info.lat = slat;
+            info.lon = slon;
+            info.elevation_angle = pc.elevation_angle;
+            info.num_radials = pc.num_radials;
+            for (int p = 0; p < NUM_PRODUCTS; p++) {
+                const auto& pd = pc.products[p];
+                if (!pd.has_data) continue;
+                info.has_product[p] = true;
+                info.num_gates[p] = pd.num_gates;
+                info.first_gate_km[p] = pd.first_gate_km;
+                info.gate_spacing_km[p] = pd.gate_spacing_km;
+                info.scale[p] = pd.scale;
+                info.offset[p] = pd.offset;
+            }
+
+            m_renderer->allocateStation(slot, info);
+            const uint16_t* gp[NUM_PRODUCTS] = {};
+            for (int p = 0; p < NUM_PRODUCTS; p++) {
+                if (pc.products[p].has_data && !pc.products[p].gates.empty())
+                    gp[p] = pc.products[p].gates.data();
+            }
+            m_renderer->uploadStationData(slot, info, pc.azimuths.data(), gp);
+            m_renderer->syncStation(slot);
+
+            sweepInfos[builtSweeps] = info;
+            azPtrs[builtSweeps] = m_renderer->getStationAzimuths(slot);
+            gatePtrs[builtSweeps] = m_renderer->getStationGates(slot, m_activeProduct);
+            builtSweeps++;
+        }
+
+        if (builtSweeps <= 0) return;
+
+        m_renderer->buildVolume(stationSlot, m_activeProduct,
+                         sweepInfos.data(), builtSweeps,
+                         azPtrs.data(), gatePtrs.data());
+        m_volumeBuilt = true;
+        m_volumeStation = stationSlot;
+    };
+
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (fr && fr->ready && !fr->sweeps.empty())
+            buildVolumeFromSweeps(fr->sweeps, fr->station_lat, fr->station_lon, 0);
+        return;
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
+
+    bool needsUpload = false;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        needsUpload = !stationUploadMatchesSelection(m_stations[m_activeStationIdx]);
+    }
+    if (needsUpload)
+        uploadStation(m_activeStationIdx);
+
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (!stationUploadMatchesSelection(st) || st.precomputed.empty()) return;
+
+    float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : st.lat;
+    float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : st.lon;
+    buildVolumeFromSweeps(st.precomputed, slat, slon, m_activeStationIdx);
+}
+
+void App::refreshActiveTiltMetadata() {
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (!fr || !fr->ready || fr->sweeps.empty()) return;
+        int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+        if (productTilts <= 0) return;
+        if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
+        m_maxTilts = productTilts;
+        int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
+        m_activeTiltAngle = fr->sweeps[sweepIdx].elevation_angle;
+        return;
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) return;
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (st.precomputed.empty()) return;
+
+    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (productTilts <= 0) return;
+    if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
+    m_maxTilts = productTilts;
+    int sweepIdx = findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
+    m_activeTiltAngle = st.precomputed[sweepIdx].elevation_angle;
+}
+
+int App::currentAvailableTilts() const {
+    if (m_historicMode) {
+        const RadarFrame* fr = m_historic.frame(m_historic.currentFrame());
+        if (!fr || !fr->ready || fr->sweeps.empty()) return 1;
+        const int tilts = countProductSweeps(fr->sweeps, m_activeProduct);
+        return std::max(1, tilts);
+    }
+
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size())
+        return std::max(1, m_maxTilts);
+
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    const auto& st = m_stations[m_activeStationIdx];
+    if (st.precomputed.empty())
+        return std::max(1, m_maxTilts);
+
+    const int tilts = countProductSweeps(st.precomputed, m_activeProduct);
+    return std::max(1, tilts);
+}
+
+void App::uploadStation(int stationIdx) {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    auto& st = m_stations[stationIdx];
+    if (st.precomputed.empty()) return;
+
+    // Filter sweeps by active product - only show tilts that have this product
+    int productTilts = countProductSweeps(st.precomputed, m_activeProduct);
+    if (productTilts <= 0) {
+        m_renderer->freeStation(stationIdx);
+        st.gpuInfo = {};
+        st.uploaded = false;
+        st.uploaded_product = -1;
+        st.uploaded_tilt = -1;
+        st.uploaded_sweep = -1;
+        st.uploaded_lowest_sweep = false;
+        m_gridDirty = true;
+        return;
+    }
+    bool lowestSweepMosaic = m_showAll || m_snapshotMode;
+    if (!lowestSweepMosaic && stationIdx == m_activeStationIdx)
+        m_maxTilts = productTilts;
+    int sweepIdx = lowestSweepMosaic
+        ? findProductSweep(st.precomputed, m_activeProduct, 0)
+        : findProductSweep(st.precomputed, m_activeProduct, m_activeTilt);
+    auto& pc = st.precomputed[sweepIdx];
+    if (pc.num_radials == 0) return;
+
+    if (!lowestSweepMosaic && (stationIdx == m_activeStationIdx || m_activeStationIdx < 0))
+        m_activeTiltAngle = pc.elevation_angle;
+
+    // Build GpuStationInfo from precomputed data
+    GpuStationInfo info = {};
+    info.lat = st.lat;
+    info.lon = st.lon;
+    if (st.data_lat != 0.0f) info.lat = st.data_lat;
+    if (st.data_lon != 0.0f) info.lon = st.data_lon;
+    info.elevation_angle = pc.elevation_angle;
+    info.num_radials = pc.num_radials;
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        auto& pd = pc.products[p];
+        if (!pd.has_data) continue;
+        info.has_product[p] = true;
+        info.num_gates[p] = pd.num_gates;
+        info.first_gate_km[p] = pd.first_gate_km;
+        info.gate_spacing_km[p] = pd.gate_spacing_km;
+        info.scale[p] = pd.scale;
+        info.offset[p] = pd.offset;
+    }
+
+    auto uploadStart = Clock::now();
+    m_renderer->allocateStation(stationIdx, info);
+
+    // Upload precomputed data (fast - just memcpy, no transposition)
+    const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        if (pc.products[p].has_data && !pc.products[p].gates.empty())
+            gatePtrs[p] = pc.products[p].gates.data();
+    }
+
+    m_renderer->uploadStationData(stationIdx, info, pc.azimuths.data(), gatePtrs);
+    const float uploadMs = elapsedMs(uploadStart, Clock::now());
+
+    st.gpuInfo = info;
+    st.timings.upload_ms = uploadMs;
+    st.uploaded_product = m_activeProduct;
+    st.uploaded_tilt = m_activeTilt;
+    st.uploaded_sweep = sweepIdx;
+    st.uploaded_lowest_sweep = lowestSweepMosaic;
+    if (!st.uploaded) {
+        st.uploaded = true;
+        int loaded = ++m_stationsLoaded;
+        printf("GPU upload [%d/%d]: %s (%d radials, elev %.1f, %d sweeps) timings: decode %.1f ms, parse %.1f ms, build %.1f ms, preprocess %.1f ms, detect %.1f ms, upload %.1f ms\n",
+               loaded, m_stationsTotal, st.icao.c_str(),
+               info.num_radials, info.elevation_angle, (int)st.precomputed.size(),
+               st.timings.decode_ms, st.timings.parse_ms, st.timings.sweep_build_ms,
+               st.timings.preprocess_ms, st.timings.detection_ms, st.timings.upload_ms);
+        // Auto-select first uploaded station so user sees data immediately
+        if (m_activeStationIdx < 0) {
+            m_activeStationIdx = stationIdx;
+            m_activeTiltAngle = pc.elevation_angle;
+            // Center viewport on this station and zoom in to see radar
+            m_viewport.center_lat = info.lat;
+            m_viewport.center_lon = info.lon;
+            m_viewport.zoom = 180.0;  // zoomed in enough to see single station
+            printf("Auto-selected station: %s (centered at %.2f, %.2f)\n",
+                   st.icao.c_str(), info.lat, info.lon);
+        }
+    }
+    m_gridDirty = true;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::buildSpatialGrid() {
+    if (!m_spatialGrid) return;
+
+    // GPU spatial grid construction
+    std::vector<GpuStationInfo> infos(m_stations.size());
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        for (int i = 0; i < (int)m_stations.size(); i++)
+            infos[i] = m_stations[i].gpuInfo;
+    }
+
+    m_renderer->buildSpatialGridGpu(infos.data(), (int)infos.size(), m_spatialGrid.get());
+    m_gridDirty = false;
+}
+
+void App::updateLivePolling(std::chrono::steady_clock::time_point now) {
+    std::vector<int> activeDue;
+    std::vector<std::pair<int, float>> visibleDue;
+    std::vector<std::pair<int, float>> backgroundDue;
+
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        activeDue.reserve(1);
+        visibleDue.reserve(m_stations.size());
+        backgroundDue.reserve(m_stations.size());
+
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            const auto& st = m_stations[i];
+            if (st.downloading) continue;
+
+            const float elapsed = st.lastPollAttempt.time_since_epoch().count() == 0
+                ? std::numeric_limits<float>::max()
+                : std::chrono::duration<float>(now - st.lastPollAttempt).count();
+            if (elapsed < livePollIntervalSecForStation(i, st))
+                continue;
+
+            if (i == m_activeStationIdx) {
+                activeDue.push_back(i);
+            } else if (stationLikelyVisible(i)) {
+                const float dLat = NEXRAD_STATIONS[i].lat - m_viewport.center_lat;
+                const float dLon = NEXRAD_STATIONS[i].lon - m_viewport.center_lon;
+                visibleDue.emplace_back(i, dLat * dLat + dLon * dLon);
+            } else {
+                backgroundDue.emplace_back(i, -elapsed);
+            }
+        }
+    }
+
+    std::sort(visibleDue.begin(), visibleDue.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    std::sort(backgroundDue.begin(), backgroundDue.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+
+    for (int idx : activeDue)
+        queueLiveStationRefresh(idx, true);
+
+    int visibleBudget = m_maxVisiblePollsPerSweep;
+    for (const auto& entry : visibleDue) {
+        if (visibleBudget-- <= 0) break;
+        queueLiveStationRefresh(entry.first, true);
+    }
+
+    int backgroundBudget = m_maxBackgroundPollsPerSweep;
+    for (const auto& entry : backgroundDue) {
+        if (backgroundBudget-- <= 0) break;
+        queueLiveStationRefresh(entry.first, true);
+    }
+}
+
+void App::update(float dt) {
+    // Historic mode: lock to event station, upload only on frame change
+    if (m_historicMode) {
+        if (m_historic.downloadedFrames() > 0) {
+            m_historic.update(dt);
+            int curFrame = m_historic.currentFrame();
+
+            // If current frame isn't ready, find nearest ready one
+            const RadarFrame* fr = m_historic.frame(curFrame);
+            if (!fr || !fr->ready) {
+                for (int i = 0; i < m_historic.numFrames(); i++) {
+                    if (m_historic.frame(i) && m_historic.frame(i)->ready) {
+                        curFrame = i;
+                        m_historic.setFrame(i);
+                        break;
+                    }
+                }
+            }
+
+            // Only upload when frame actually changes
+            if (curFrame != m_lastHistoricFrame) {
+                fr = m_historic.frame(curFrame);
+                if (fr && fr->ready) {
+                    uploadHistoricFrame(curFrame);
+                    if (!fr->valid_time_iso.empty())
+                        m_warnings.requestHistoricSnapshot(fr->valid_time_iso);
+                    m_lastHistoricFrame = curFrame;
+                    printf("Historic frame %d: %s\n", curFrame, fr->timestamp.c_str());
+                }
+            }
+        }
+        refreshWarningOverlayState();
+        return;
+    }
+
+    // Process GPU upload queue
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        for (int idx : m_uploadQueue) {
+            uploadStation(idx);
+            if (m_liveLoopEnabled && !m_snapshotMode && !m_historicMode &&
+                !m_mode3D && !m_crossSection) {
+                if (!m_showAll && idx == m_activeStationIdx)
+                    requestLiveLoopBackfill();
+                else if (m_showAll)
+                    requestLiveLoopCapture();
+            }
+        }
+        m_uploadQueue.clear();
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    const float schedulerElapsed =
+        std::chrono::duration<float>(now - m_lastLivePollSweep).count();
+    if (!m_snapshotMode && schedulerElapsed >= m_livePollSweepIntervalSec) {
+        if (m_singleStationMode) {
+            // iOS: only refresh the active station
+            if (m_activeStationIdx >= 0)
+                queueLiveStationRefresh(m_activeStationIdx, false);
+        } else {
+            updateLivePolling(now);
+        }
+        m_lastLivePollSweep = now;
+    }
+
+    processLiveLoopBackfill();
+    updateLiveLoop(dt);
+    refreshWarningOverlayState();
+}
+
+void App::render() {
+    if (m_singleStationMode && !needsRender()) {
+        return;
+    }
+
+    // Rebuild spatial grid if needed
+    if (m_gridDirty) {
+        buildSpatialGrid();
+    }
+
+    {
+        GpuViewport gpuVp;
+        gpuVp.center_lat = (float)m_viewport.center_lat;
+        gpuVp.center_lon = (float)m_viewport.center_lon;
+        gpuVp.deg_per_pixel_x = 1.0f / (float)m_viewport.zoom;
+        gpuVp.deg_per_pixel_y = 1.0f / (float)m_viewport.zoom;
+        gpuVp.width = m_viewport.width;
+        gpuVp.height = m_viewport.height;
+
+        float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
+        float srvDir = m_stormDir;
+        float activeThreshold = (m_activeProduct == PROD_VEL)
+            ? m_velocityMinThreshold
+            : m_dbzMinThreshold;
+        const bool capturePending =
+            m_liveLoopEnabled &&
+            m_liveLoopCapturePending &&
+            !m_historicMode &&
+            !m_snapshotMode &&
+            !m_mode3D &&
+            !m_crossSection;
+        const bool useLiveLoopFrame =
+            !m_historicMode &&
+            !m_snapshotMode &&
+            !m_mode3D &&
+            !m_crossSection &&
+            m_liveLoopEnabled &&
+            m_liveLoopCount > 0 &&
+            !capturePending &&
+            (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1)) &&
+            m_liveLoopFrameWidth == gpuVp.width &&
+            m_liveLoopFrameHeight == gpuVp.height;
+        bool requiresGpuCompletionBeforeCpuAccess = false;
+
+        if (useLiveLoopFrame) {
+            const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
+            const size_t sz = (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t);
+            memcpy(m_d_compositeOutput.contents, m_liveLoopFrames[slot].contents, sz);
+        } else if (m_mode3D && m_volumeBuilt) {
+            // 3D volumetric ray march
+            m_renderer->renderVolume(m_camera, gpuVp.width, gpuVp.height,
+                              m_activeProduct, activeThreshold,
+                              m_d_compositeOutput);
+            requiresGpuCompletionBeforeCpuAccess = true;
+        } else if (m_historicMode) {
+            int cf = m_historic.currentFrame();
+            if (hasCachedFrame(cf, gpuVp.width, gpuVp.height)) {
+                // Use pre-baked cached frame (zero render cost)
+                size_t sz = (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t);
+                memcpy(m_d_compositeOutput.contents, m_cachedFrames[cf].contents, sz);
+            } else {
+                m_renderer->renderSingleStation(gpuVp, 0,
+                                         m_activeProduct, activeThreshold,
+                                         m_d_compositeOutput, srvSpd, srvDir);
+                // Cache this rendered frame for instant replay
+                requiresGpuCompletionBeforeCpuAccess = true;
+            }
+        } else if (m_showAll) {
+            // Mosaic: visible stations only, capped for performance
+            if (m_gridDirty) buildSpatialGrid();
+            std::vector<GpuStationInfo> gpuInfos(m_stations.size());
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                for (int i = 0; i < (int)m_stations.size(); i++)
+                    gpuInfos[i] = m_stations[i].gpuInfo;
+            }
+            m_renderer->renderNative(gpuVp, gpuInfos.data(), (int)m_stations.size(),
+                              *m_spatialGrid, m_activeProduct, activeThreshold,
+                              m_d_compositeOutput);
+            requiresGpuCompletionBeforeCpuAccess = true;
+        } else if (m_activeStationIdx >= 0) {
+            // Single station: fast path
+            bool needsUpload = false;
+            if (m_activeStationIdx < (int)m_stations.size()) {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                needsUpload = !stationUploadMatchesSelection(m_stations[m_activeStationIdx]);
+            }
+            if (needsUpload) {
+                uploadStation(m_activeStationIdx);
+            }
+            m_renderer->forwardRenderStation(gpuVp, m_activeStationIdx,
+                                      m_activeProduct, activeThreshold,
+                                      m_d_compositeOutput, srvSpd, srvDir);
+            requiresGpuCompletionBeforeCpuAccess = true;
+        } else {
+            memset(m_d_compositeOutput.contents, 0x00,
+                   (size_t)m_viewport.width * m_viewport.height * sizeof(uint32_t));
+        }
+        // Cross-section: render to separate texture for floating panel
+        // In historic mode, use slot 0's data; otherwise use active station
+        int xsStationSlot = m_historicMode ? 0 : m_activeStationIdx;
+        if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
+            xsStationSlot < (int)m_stations.size()) {
+            GpuStationInfo stInfo = {};
+            {
+                std::lock_guard<std::mutex> lock(m_stationMutex);
+                stInfo = m_stations[xsStationSlot].gpuInfo;
+            }
+            m_xsWidth = gpuVp.width;
+            m_xsHeight = gpuVp.height / 3;
+            if (m_xsHeight < 200) m_xsHeight = 200;
+
+            // Ensure cross-section GPU buffer and Metal texture exist
+            ensureCrossSectionBuffer(m_xsWidth, m_xsHeight);
+            m_xsTex.resize(m_xsWidth, m_xsHeight);
+
+            m_renderer->renderCrossSection(
+                m_activeStationIdx, m_activeProduct, activeThreshold,
+                m_xsStartLat, m_xsStartLon, m_xsEndLat, m_xsEndLon,
+                stInfo.lat, stInfo.lon,
+                m_xsWidth, m_xsHeight, m_d_xsOutput);
+            requiresGpuCompletionBeforeCpuAccess = true;
+        }
+
+        if (requiresGpuCompletionBeforeCpuAccess)
+            m_renderer->waitForGpu();
+
+        if (!useLiveLoopFrame &&
+            m_historicMode &&
+            hasCachedFrame(m_historic.currentFrame(), gpuVp.width, gpuVp.height) == false) {
+            cacheAnimFrame(m_historic.currentFrame(), m_d_compositeOutput, gpuVp.width, gpuVp.height);
+        }
+
+        if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
+            xsStationSlot < (int)m_stations.size()) {
+            m_xsTex.updateFromBuffer(m_d_xsOutput, m_xsWidth, m_xsHeight,
+                                     m_renderer->getQueue());
+        }
+
+        if (!useLiveLoopFrame &&
+            !m_historicMode &&
+            !m_snapshotMode &&
+            !m_mode3D &&
+            !m_crossSection &&
+            m_liveLoopEnabled &&
+            m_liveLoopCapturePending) {
+            captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height,
+                                 currentLiveLoopCaptureLabel());
+        }
+
+        rasterizeBoundaries();
+        compositeBoundaries();
+
+        // Copy to display texture (macOS only — iOS reads the buffer directly)
+        if (!m_singleStationMode) {
+            m_outputTex.updateFromBuffer(m_d_compositeOutput,
+                                          m_viewport.width, m_viewport.height,
+                                          m_renderer->getQueue());
+        }
+    }
+
+    m_needsRerender = false;
+    m_needsComposite = false;
+}
+
+void App::invalidateLiveLoop(bool freeMemory) {
+    m_liveLoopBackfillGeneration.fetch_add(1);
+    m_liveLoopBackfillLoading = false;
+    m_liveLoopBackfillStationIdx = -1;
+    m_liveLoopBackfillCurrentKey.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+        m_liveLoopBackfillQueue.clear();
+    }
+    m_liveLoopBackfillReplaceExisting = false;
+    resetLiveLoopFrameCache(freeMemory);
+}
+
+void App::resetLiveLoopFrameCache(bool freeMemory) {
+    if (freeMemory) {
+        for (auto& frame : m_liveLoopFrames)
+            frame = nil;
+        m_liveLoopFrameWidth = 0;
+        m_liveLoopFrameHeight = 0;
+    }
+
+    for (auto& label : m_liveLoopLabels)
+        label.clear();
+
+    m_liveLoopPlaying = false;
+    m_liveLoopCount = 0;
+    m_liveLoopWriteIndex = 0;
+    m_liveLoopPlaybackIndex = 0;
+    m_liveLoopAccumulator = 0.0f;
+    m_liveLoopCapturePending = false;
+}
+
+void App::requestLiveLoopCapture() {
+    if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection)
+        return;
+    m_liveLoopCapturePending = true;
+    m_needsRerender = true;
+}
+
+void App::requestLiveLoopBackfill() {
+    if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection) {
+        requestLiveLoopCapture();
+        return;
+    }
+    if (m_showAll || m_activeStationIdx < 0 || m_activeStationIdx >= (int)m_stations.size()) {
+        requestLiveLoopCapture();
+        return;
+    }
+
+    const int desiredFrames = std::max(1, std::min(m_liveLoopLength, MAX_LIVE_LOOP_FRAMES));
+    const int requestStationIdx = m_activeStationIdx;
+    std::string stationCode;
+    std::string currentKey;
+    float fallbackLat = 0.0f;
+    float fallbackLon = 0.0f;
+    std::vector<LiveLoopBackfillFrame> localFrames;
+    const bool dealiasEnabled = m_dealias;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        const auto& st = m_stations[requestStationIdx];
+        stationCode = st.icao;
+        currentKey = st.latestVolumeKey;
+        fallbackLat = (st.data_lat != 0.0f) ? st.data_lat : st.lat;
+        fallbackLon = (st.data_lon != 0.0f) ? st.data_lon : st.lon;
+        const int historyStart = std::max(0, (int)st.live_history.size() - desiredFrames);
+        localFrames.reserve((int)st.live_history.size() - historyStart);
+        for (int i = historyStart; i < (int)st.live_history.size(); i++) {
+            const auto& entry = st.live_history[i];
+            if (entry.sweeps.empty())
+                continue;
+            LiveLoopBackfillFrame frame;
+            frame.label = entry.label.empty() ? formatVolumeKeyTimestamp(entry.volume_key) : entry.label;
+            frame.sweeps = entry.sweeps;
+            frame.station_lat = entry.station_lat != 0.0f ? entry.station_lat : fallbackLat;
+            frame.station_lon = entry.station_lon != 0.0f ? entry.station_lon : fallbackLon;
+            localFrames.push_back(std::move(frame));
+        }
+    }
+    if (stationCode.empty()) {
+        requestLiveLoopCapture();
+        return;
+    }
+
+    if (m_liveLoopBackfillStationIdx == requestStationIdx &&
+        m_liveLoopBackfillLoading.load()) {
+        return;
+    }
+
+    const uint64_t generation = m_liveLoopBackfillGeneration.fetch_add(1) + 1;
+    m_liveLoopBackfillStationIdx = requestStationIdx;
+    m_liveLoopBackfillCurrentKey = currentKey;
+    {
+        std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+        m_liveLoopBackfillQueue.clear();
+        for (auto& frame : localFrames)
+            m_liveLoopBackfillQueue.push_back(std::move(frame));
+        m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
+    }
+    if (localFrames.empty()) {
+        resetLiveLoopFrameCache(false);
+        if (!currentKey.empty())
+            requestLiveLoopCapture();
+    }
+    m_needsRerender = true;
+
+    if ((int)localFrames.size() >= desiredFrames) {
+        m_liveLoopBackfillLoading = false;
+        return;
+    }
+
+    m_liveLoopBackfillLoading = true;
+
+    int year = 0, month = 0, day = 0;
+    if (!extractVolumeKeyDate(currentKey, year, month, day))
+        getUtcDate(year, month, day);
+
+    const std::string listQuery = buildLiveListQuery(stationCode, year, month, day, {});
+    Downloader* listDownloader = m_liveLoopDownloader ? m_liveLoopDownloader.get() : m_downloader.get();
+    if (!listDownloader) {
+        m_liveLoopBackfillLoading = false;
+        requestLiveLoopCapture();
+        return;
+    }
+
+    listDownloader->queueDownload(
+        stationCode + "_live_loop_backfill",
+        NEXRAD_HOST,
+        listQuery,
+        [this, generation, stationCode, currentKey, desiredFrames, dealiasEnabled,
+         fallbackLat, fallbackLon, year, month, day, requestStationIdx](const std::string& id, DownloadResult listResult) {
+            (void)id;
+            if (generation != m_liveLoopBackfillGeneration.load())
+                return;
+
+            auto fetchList = [&](int y, int m, int d, std::vector<NexradFile>& outFiles) -> bool {
+                DownloadResult result = Downloader::httpGet(NEXRAD_HOST, buildLiveListQuery(stationCode, y, m, d, {}));
+                if (!result.success || result.data.empty())
+                    return false;
+                std::string xml(result.data.begin(), result.data.end());
+                outFiles = parseS3ListResponse(xml);
+                return !outFiles.empty();
+            };
+
+            std::vector<NexradFile> files;
+            if (listResult.success && !listResult.data.empty()) {
+                std::string xml(listResult.data.begin(), listResult.data.end());
+                files = parseS3ListResponse(xml);
+            }
+            if (files.empty() && !fetchList(year, month, day, files)) {
+                m_liveLoopBackfillLoading = false;
+                requestLiveLoopCapture();
+                return;
+            }
+
+            int endIndex = (int)files.size() - 1;
+            if (!currentKey.empty()) {
+                for (int i = (int)files.size() - 1; i >= 0; --i) {
+                    if (files[i].key <= currentKey) {
+                        endIndex = i;
+                        break;
+                    }
+                }
+            }
+            if (endIndex < 0) {
+                m_liveLoopBackfillLoading = false;
+                requestLiveLoopCapture();
+                return;
+            }
+
+            std::vector<std::string> selectedKeys;
+            int need = desiredFrames;
+            const int startIndex = std::max(0, endIndex - need + 1);
+            for (int i = startIndex; i <= endIndex; i++)
+                selectedKeys.push_back(files[i].key);
+            need -= (int)selectedKeys.size();
+
+            if (need > 0) {
+                int prevYear = year;
+                int prevMonth = month;
+                int prevDay = day;
+                shiftDate(prevYear, prevMonth, prevDay, -1);
+                std::vector<NexradFile> previousFiles;
+                if (fetchList(prevYear, prevMonth, prevDay, previousFiles) && !previousFiles.empty()) {
+                    const int take = std::min(need, (int)previousFiles.size());
+                    std::vector<std::string> priorKeys;
+                    priorKeys.reserve(take);
+                    for (int i = (int)previousFiles.size() - take; i < (int)previousFiles.size(); i++)
+                        priorKeys.push_back(previousFiles[i].key);
+                    selectedKeys.insert(selectedKeys.begin(), priorKeys.begin(), priorKeys.end());
+                }
+            }
+
+            struct OrderedLoopFrame {
+                std::string key;
+                LiveLoopBackfillFrame frame;
+            };
+            std::vector<OrderedLoopFrame> orderedFrames;
+            orderedFrames.reserve(desiredFrames);
+            {
+                std::lock_guard<std::mutex> stationLock(m_stationMutex);
+                if (requestStationIdx >= 0 && requestStationIdx < (int)m_stations.size()) {
+                    const auto& st = m_stations[requestStationIdx];
+                    const int historyStart = std::max(0, (int)st.live_history.size() - desiredFrames);
+                    for (int i = historyStart; i < (int)st.live_history.size(); i++) {
+                        const auto& entry = st.live_history[i];
+                        if (entry.sweeps.empty())
+                            continue;
+                        OrderedLoopFrame ordered;
+                        ordered.key = entry.volume_key;
+                        ordered.frame.label = entry.label.empty()
+                            ? formatVolumeKeyTimestamp(entry.volume_key)
+                            : entry.label;
+                        ordered.frame.sweeps = entry.sweeps;
+                        ordered.frame.station_lat =
+                            entry.station_lat != 0.0f ? entry.station_lat : fallbackLat;
+                        ordered.frame.station_lon =
+                            entry.station_lon != 0.0f ? entry.station_lon : fallbackLon;
+                        orderedFrames.push_back(std::move(ordered));
+                    }
+                }
+            }
+
+            std::unordered_set<std::string> existingKeys;
+            existingKeys.reserve(orderedFrames.size() + selectedKeys.size());
+            for (const auto& existing : orderedFrames)
+                existingKeys.insert(existing.key);
+
+            std::vector<std::string> keysToFetch;
+            keysToFetch.reserve(selectedKeys.size());
+            for (const auto& key : selectedKeys) {
+                if (existingKeys.insert(key).second)
+                    keysToFetch.push_back(key);
+            }
+
+            fprintf(stderr, "Live loop backfill %s: local=%zu requested=%d fetch=%zu current=%s\n",
+                    stationCode.c_str(), orderedFrames.size(), desiredFrames, keysToFetch.size(),
+                    currentKey.empty() ? "<none>" : currentKey.c_str());
+
+            if (!keysToFetch.empty()) {
+                std::mutex orderedFramesMutex;
+                auto backfillDownloader = std::make_shared<Downloader>(
+                    std::min<int>(8, (int)keysToFetch.size()));
+                for (auto keyIt = keysToFetch.rbegin(); keyIt != keysToFetch.rend(); ++keyIt) {
+                    const auto& key = *keyIt;
+                    backfillDownloader->queueDownload(
+                        key, NEXRAD_HOST, "/" + key,
+                        [this, &orderedFrames, &orderedFramesMutex, generation,
+                         dealiasEnabled, fallbackLat, fallbackLon](const std::string& id, DownloadResult result) {
+                            if (generation != m_liveLoopBackfillGeneration.load())
+                                return;
+                            if (!result.success || result.data.empty())
+                                return;
+
+                            auto parsed = Level2Parser::parse(result.data);
+                            if (parsed.sweeps.empty())
+                                return;
+
+                            LiveLoopBackfillFrame frame;
+                            frame.label = formatVolumeKeyTimestamp(id);
+                            frame.sweeps = buildPrecomputedSweeps(parsed);
+                            if (dealiasEnabled)
+                                dealiasPrecomputedSweeps(frame.sweeps);
+                            frame.station_lat = (parsed.station_lat != 0.0f) ? parsed.station_lat : fallbackLat;
+                            frame.station_lon = (parsed.station_lon != 0.0f) ? parsed.station_lon : fallbackLon;
+                            if (frame.sweeps.empty())
+                                return;
+
+                            OrderedLoopFrame ordered;
+                            ordered.key = id;
+                            ordered.frame = std::move(frame);
+                            std::lock_guard<std::mutex> lock(orderedFramesMutex);
+                            orderedFrames.push_back(std::move(ordered));
+                        });
+                }
+
+                backfillDownloader->waitAll();
+                if (generation != m_liveLoopBackfillGeneration.load()) {
+                    m_liveLoopBackfillLoading = false;
+                    return;
+                }
+            }
+
+            std::sort(orderedFrames.begin(), orderedFrames.end(),
+                      [](const OrderedLoopFrame& a, const OrderedLoopFrame& b) {
+                          return a.key < b.key;
+                      });
+            orderedFrames.erase(
+                std::unique(orderedFrames.begin(), orderedFrames.end(),
+                            [](const OrderedLoopFrame& a, const OrderedLoopFrame& b) {
+                                return a.key == b.key;
+                            }),
+                orderedFrames.end());
+            if ((int)orderedFrames.size() > desiredFrames) {
+                orderedFrames.erase(orderedFrames.begin(),
+                                    orderedFrames.end() - desiredFrames);
+            }
+
+            {
+                std::lock_guard<std::mutex> stationLock(m_stationMutex);
+                if (requestStationIdx >= 0 && requestStationIdx < (int)m_stations.size()) {
+                    auto& st = m_stations[requestStationIdx];
+                    for (const auto& ordered : orderedFrames) {
+                        appendLiveHistoryLocked(st,
+                                                ordered.key,
+                                                ordered.frame.sweeps,
+                                                ordered.frame.station_lat,
+                                                ordered.frame.station_lon);
+                    }
+                }
+            }
+            trimLiveHistoryWorkingSet(requestStationIdx);
+
+            if (generation == m_liveLoopBackfillGeneration.load()) {
+                std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+                m_liveLoopBackfillQueue.clear();
+                for (auto& ordered : orderedFrames)
+                    m_liveLoopBackfillQueue.push_back(std::move(ordered.frame));
+                m_liveLoopBackfillReplaceExisting = !m_liveLoopBackfillQueue.empty();
+                m_liveLoopBackfillLoading = false;
+                fprintf(stderr, "Live loop backfill %s ready: %zu frames queued\n",
+                        stationCode.c_str(), orderedFrames.size());
+                if (orderedFrames.empty())
+                    requestLiveLoopCapture();
+                else
+                    m_needsRerender = true;
+            }
+        });
+}
+
+int App::liveLoopSlotForIndex(int index) const {
+    if (m_liveLoopCount <= 0)
+        return 0;
+    index = std::max(0, std::min(index, m_liveLoopCount - 1));
+    const int oldestSlot =
+        (m_liveLoopWriteIndex - m_liveLoopCount + MAX_LIVE_LOOP_FRAMES) % MAX_LIVE_LOOP_FRAMES;
+    return (oldestSlot + index) % MAX_LIVE_LOOP_FRAMES;
+}
+
+std::string App::currentLiveLoopCaptureLabel() const {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    if (m_activeStationIdx >= 0 && m_activeStationIdx < (int)m_stations.size()) {
+        const auto& st = m_stations[m_activeStationIdx];
+        const std::string ts = formatVolumeKeyTimestamp(st.latestVolumeKey);
+        if (!ts.empty())
+            return ts;
+        if (!st.icao.empty())
+            return st.icao;
+    }
+    return "Live";
+}
+
+void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::string& label) {
+    if (!m_liveLoopEnabled || m_liveLoopLength <= 0 || !src || w <= 0 || h <= 0)
+        return;
+
+    if ((m_liveLoopFrameWidth > 0 || m_liveLoopFrameHeight > 0) &&
+        (m_liveLoopFrameWidth != w || m_liveLoopFrameHeight != h)) {
+        invalidateLiveLoop(true);
+    }
+
+    m_liveLoopFrameWidth = w;
+    m_liveLoopFrameHeight = h;
+
+    const int slot = m_liveLoopWriteIndex;
+    const size_t sz = (size_t)w * h * sizeof(uint32_t);
+    if (!m_liveLoopFrames[slot])
+        m_liveLoopFrames[slot] = [m_renderer->getDevice() newBufferWithLength:sz
+                                                                      options:MTLResourceStorageModeShared];
+    memcpy(m_liveLoopFrames[slot].contents, src.contents, sz);
+    m_liveLoopLabels[slot] = label;
+
+    if (m_liveLoopCount < m_liveLoopLength)
+        m_liveLoopCount++;
+
+    m_liveLoopWriteIndex = (m_liveLoopWriteIndex + 1) % MAX_LIVE_LOOP_FRAMES;
+    m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    m_liveLoopCapturePending = false;
+    m_needsRerender = true;
+}
+
+void App::updateLiveLoop(float dt) {
+    if (!m_liveLoopEnabled || !m_liveLoopPlaying || m_liveLoopCount <= 1)
+        return;
+
+    const float fps = std::max(1.0f, m_liveLoopSpeed);
+    m_liveLoopAccumulator += dt;
+    const float frameInterval = 1.0f / fps;
+    bool advanced = false;
+    while (m_liveLoopAccumulator >= frameInterval) {
+        m_liveLoopAccumulator -= frameInterval;
+        m_liveLoopPlaybackIndex = (m_liveLoopPlaybackIndex + 1) % m_liveLoopCount;
+        advanced = true;
+    }
+    if (advanced) {
+        m_needsRerender = true;
+        m_needsComposite = true;
+    }
+}
+
+void App::processLiveLoopBackfill() {
+    if (!m_liveLoopEnabled || m_historicMode || m_snapshotMode || m_mode3D || m_crossSection)
+        return;
+
+    constexpr int kMaxFramesPerPass = 8;
+    bool processedAny = false;
+
+    for (int processed = 0; processed < kMaxFramesPerPass; ++processed) {
+        LiveLoopBackfillFrame frame;
+        bool haveFrame = false;
+        bool replaceExisting = false;
+        {
+            std::lock_guard<std::mutex> lock(m_liveLoopBackfillMutex);
+            if (!m_liveLoopBackfillQueue.empty() && m_liveLoopBackfillReplaceExisting) {
+                replaceExisting = true;
+                m_liveLoopBackfillReplaceExisting = false;
+            }
+            if (!m_liveLoopBackfillQueue.empty()) {
+                frame = std::move(m_liveLoopBackfillQueue.front());
+                m_liveLoopBackfillQueue.pop_front();
+                haveFrame = true;
+            }
+        }
+
+        if (!haveFrame)
+            break;
+
+        if (replaceExisting)
+            resetLiveLoopFrameCache(false);
+
+        const int productTilts = countProductSweeps(frame.sweeps, m_activeProduct);
+        if (productTilts <= 0)
+            continue;
+
+        const int sweepIdx = findProductSweep(frame.sweeps, m_activeProduct,
+                                              std::min(m_activeTilt, productTilts - 1));
+        if (sweepIdx < 0 || sweepIdx >= (int)frame.sweeps.size())
+            continue;
+
+        const auto& pc = frame.sweeps[sweepIdx];
+        if (pc.num_radials <= 0)
+            continue;
+
+        constexpr int kLiveLoopBackfillSlot = MAX_STATIONS - 1;
+        GpuStationInfo info = {};
+        info.lat = frame.station_lat;
+        info.lon = frame.station_lon;
+        info.elevation_angle = pc.elevation_angle;
+        info.num_radials = pc.num_radials;
+
+        const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+        for (int p = 0; p < NUM_PRODUCTS; p++) {
+            const auto& pd = pc.products[p];
+            if (!pd.has_data)
+                continue;
+            info.has_product[p] = true;
+            info.num_gates[p] = pd.num_gates;
+            info.first_gate_km[p] = pd.first_gate_km;
+            info.gate_spacing_km[p] = pd.gate_spacing_km;
+            info.scale[p] = pd.scale;
+            info.offset[p] = pd.offset;
+            if (!pd.gates.empty())
+                gatePtrs[p] = pd.gates.data();
+        }
+
+        m_renderer->allocateStation(kLiveLoopBackfillSlot, info);
+        m_renderer->uploadStationData(kLiveLoopBackfillSlot, info, pc.azimuths.data(), gatePtrs);
+        m_renderer->syncStation(kLiveLoopBackfillSlot);
+
+        GpuViewport gpuVp;
+        gpuVp.center_lat = (float)m_viewport.center_lat;
+        gpuVp.center_lon = (float)m_viewport.center_lon;
+        gpuVp.deg_per_pixel_x = 1.0f / (float)m_viewport.zoom;
+        gpuVp.deg_per_pixel_y = 1.0f / (float)m_viewport.zoom;
+        gpuVp.width = m_viewport.width;
+        gpuVp.height = m_viewport.height;
+
+        const float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
+        const float activeThreshold = (m_activeProduct == PROD_VEL)
+            ? m_velocityMinThreshold
+            : m_dbzMinThreshold;
+        m_renderer->forwardRenderStation(gpuVp, kLiveLoopBackfillSlot,
+                                         m_activeProduct, activeThreshold,
+                                         m_d_compositeOutput, srvSpd, m_stormDir);
+        m_renderer->waitForGpu();
+        captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height, frame.label);
+        m_renderer->freeStation(kLiveLoopBackfillSlot);
+        processedAny = true;
+    }
+
+    if (!processedAny && !m_liveLoopBackfillLoading && m_liveLoopCount == 0)
+        requestLiveLoopCapture();
+}
+
+void App::setLiveLoopEnabled(bool enabled) {
+    if (m_liveLoopEnabled == enabled)
+        return;
+
+    m_liveLoopEnabled = enabled;
+    if (!enabled) {
+        invalidateLiveLoop(true);
+        m_needsRerender = true;
+        return;
+    }
+
+    requestLiveLoopBackfill();
+}
+
+void App::toggleLiveLoopPlayback() {
+    if (!m_liveLoopEnabled)
+        setLiveLoopEnabled(true);
+    if (m_liveLoopBackfillLoading || m_liveLoopCount < m_liveLoopLength) {
+        requestLiveLoopBackfill();
+        m_liveLoopPlaying = false;
+        m_liveLoopAccumulator = 0.0f;
+        return;
+    }
+    if (m_liveLoopCount <= 1) {
+        m_liveLoopPlaying = false;
+        requestLiveLoopBackfill();
+        return;
+    }
+
+    m_liveLoopPlaying = !m_liveLoopPlaying;
+    m_liveLoopAccumulator = 0.0f;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::setLiveLoopLength(int frames) {
+    frames = std::max(1, std::min(frames, MAX_LIVE_LOOP_FRAMES));
+    if (m_liveLoopLength == frames)
+        return;
+
+    m_liveLoopLength = frames;
+    if (m_liveLoopCount > m_liveLoopLength)
+        m_liveLoopCount = m_liveLoopLength;
+    if (m_liveLoopCount <= 0) {
+        m_liveLoopPlaybackIndex = 0;
+    } else if (m_liveLoopPlaybackIndex >= m_liveLoopCount) {
+        m_liveLoopPlaybackIndex = m_liveLoopCount - 1;
+    }
+
+    if (m_liveLoopEnabled)
+        requestLiveLoopBackfill();
+}
+
+void App::setLiveLoopPlaybackFrame(int index) {
+    if (m_liveLoopCount <= 0) {
+        m_liveLoopPlaybackIndex = 0;
+        m_liveLoopPlaying = false;
+        return;
+    }
+
+    m_liveLoopPlaybackIndex = std::max(0, std::min(index, m_liveLoopCount - 1));
+    m_liveLoopPlaying = false;
+    m_liveLoopAccumulator = 0.0f;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::setLiveLoopSpeed(float fps) {
+    m_liveLoopSpeed = std::max(1.0f, std::min(fps, 30.0f));
+}
+
+bool App::liveLoopViewingHistory() const {
+    return m_liveLoopEnabled &&
+           m_liveLoopCount > 0 &&
+           (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1));
+}
+
+std::string App::liveLoopCurrentLabel() const {
+    if (m_liveLoopCount <= 0)
+        return {};
+    const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
+    return m_liveLoopLabels[slot];
+}
+
+void App::clearLiveLoop() {
+    invalidateLiveLoop(true);
+    m_needsRerender = true;
+}
+
+void App::rasterizeBoundaries() {
+    int w = m_viewport.width, h = m_viewport.height;
+    double cx = m_viewport.center_lon, cy = m_viewport.center_lat;
+    double z = m_viewport.zoom;
+    const auto warnings = currentWarnings();
+    const uint64_t warningSignature = computeWarningSignature(warnings, m_warningOptions);
+
+    // Check if cache is still valid
+    if (m_boundaryCacheW == w && m_boundaryCacheH == h &&
+        m_boundaryCacheCLat == cy && m_boundaryCacheCLon == cx &&
+        m_boundaryCacheZoom == z &&
+        m_boundaryCacheWarningSignature == warningSignature &&
+        !m_boundaryCache.empty()) {
+        return; // cache is current, nothing to do
+    }
+
+    // Re-rasterize boundaries into cache
+    size_t npx = (size_t)w * h;
+    m_boundaryCache.assign(npx, 0); // transparent
+    m_boundaryCacheW = w;
+    m_boundaryCacheH = h;
+    m_boundaryCacheCLat = cy;
+    m_boundaryCacheCLon = cx;
+    m_boundaryCacheZoom = z;
+    m_boundaryCacheWarningSignature = warningSignature;
+
+    uint32_t lineColor = 0xFF555540; // ABGR: muted dark teal
+    uint32_t* px = m_boundaryCache.data();
+
+    for (int i = 0; i < US_STATE_LINE_COUNT; i++) {
+        float lat1 = US_STATE_LINES[i * 4 + 0];
+        float lon1 = US_STATE_LINES[i * 4 + 1];
+        float lat2 = US_STATE_LINES[i * 4 + 2];
+        float lon2 = US_STATE_LINES[i * 4 + 3];
+
+        int x1 = (int)((lon1 - cx) * z + w * 0.5);
+        int y1 = (int)((cy - lat1) * z + h * 0.5);
+        int x2 = (int)((lon2 - cx) * z + w * 0.5);
+        int y2 = (int)((cy - lat2) * z + h * 0.5);
+
+        if ((x1 < -10 && x2 < -10) || (x1 > w + 10 && x2 > w + 10)) continue;
+        if ((y1 < -10 && y2 < -10) || (y1 > h + 10 && y2 > h + 10)) continue;
+
+        int dx = abs(x2 - x1), dy = abs(y2 - y1);
+        int sx = x1 < x2 ? 1 : -1, sy = y1 < y2 ? 1 : -1;
+        int err = dx - dy;
+        int steps = 0, maxSteps = dx + dy + 1;
+        while (steps++ < maxSteps) {
+            if (x1 >= 0 && x1 < w && y1 >= 0 && y1 < h)
+                px[y1 * w + x1] = lineColor;
+            if (x1 == x2 && y1 == y2) break;
+            int e2 = 2 * err;
+            if (e2 > -dy) { err -= dy; x1 += sx; }
+            if (e2 < dx) { err += dx; y1 += sy; }
+        }
+    }
+
+    for (const auto& warning : warnings) {
+        if (warning.lats.size() < 3 || warning.lats.size() != warning.lons.size())
+            continue;
+
+        std::vector<std::pair<int, int>> points;
+        points.reserve(warning.lats.size());
+        bool anyOnScreen = false;
+
+        for (size_t i = 0; i < warning.lats.size(); ++i) {
+            int sx = (int)((warning.lons[i] - cx) * z + w * 0.5);
+            int sy = (int)((cy - warning.lats[i]) * z + h * 0.5);
+            points.emplace_back(sx, sy);
+            if (sx > -100 && sx < w + 100 && sy > -100 && sy < h + 100)
+                anyOnScreen = true;
+        }
+
+        if (!anyOnScreen)
+            continue;
+
+        const uint32_t outlineColor = (warning.color & 0x00FFFFFFu) | 0xFF000000u;
+        const int thickness = std::max(1, (int)std::round(warning.line_width));
+        for (size_t i = 0; i < points.size(); ++i) {
+            const auto& a = points[i];
+            const auto& b = points[(i + 1) % points.size()];
+            drawOverlayLine(px, w, h, a.first, a.second, b.first, b.second, outlineColor, thickness);
+        }
+    }
+}
+
+void App::compositeBoundaries() {
+    int w = m_viewport.width, h = m_viewport.height;
+    if (m_boundaryCache.empty() || m_boundaryCacheW != w || m_boundaryCacheH != h) return;
+
+    uint32_t* dst = (uint32_t*)m_d_compositeOutput.contents;
+    const uint32_t* src = m_boundaryCache.data();
+    size_t npx = (size_t)w * h;
+    for (size_t i = 0; i < npx; i++) {
+        if (src[i]) dst[i] = src[i];
+    }
+}
+
+void App::onScroll(double xoff, double yoff) {
+    invalidateFrameCache(true);
+    m_liveLoopPlaying = false;
+    if (m_liveLoopCount > 0)
+        m_liveLoopPlaybackIndex = m_liveLoopCount - 1;
+    m_liveLoopAccumulator = 0.0f;
+    if (m_mode3D) {
+        // 3D: scroll orbits camera
+        m_camera.orbit_angle += (float)xoff * 2.0f;
+        m_camera.tilt_angle -= (float)yoff * 2.0f;
+        m_camera.tilt_angle = std::max(5.0f, std::min(85.0f, m_camera.tilt_angle));
+    } else {
+        // 2D: two-finger scroll = PAN (like Apple Maps)
+        m_viewport.center_lon -= xoff / m_viewport.zoom;
+        m_viewport.center_lat += yoff / m_viewport.zoom;
+    }
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::onMagnify(double magnification) {
+    // Pinch-to-zoom anchored to cursor position
+    invalidateFrameCache(true);
+    m_liveLoopPlaying = false;
+    if (m_liveLoopCount > 0)
+        m_liveLoopPlaybackIndex = m_liveLoopCount - 1;
+    m_liveLoopAccumulator = 0.0f;
+    if (m_mode3D) {
+        m_camera.distance *= (1.0f - (float)magnification);
+        m_camera.distance = std::max(50.0f, std::min(1500.0f, m_camera.distance));
+    } else {
+        // Lat/lon under cursor before zoom
+        double cursorLon = m_viewport.center_lon + (m_mouseLon - m_viewport.center_lon);
+        double cursorLat = m_viewport.center_lat + (m_mouseLat - m_viewport.center_lat);
+
+        double factor = 1.0 + magnification;
+        double newZoom = m_viewport.zoom * factor;
+        newZoom = std::max(1.0, std::min(newZoom, 2000.0));
+
+        // Shift center so the cursor lat/lon stays in the same screen position
+        // Before: screenX = (cursorLon - center_lon) * oldZoom + w/2
+        // After:  screenX = (cursorLon - newCenter_lon) * newZoom + w/2
+        // Set equal: newCenter = cursorLon - (cursorLon - center_lon) * oldZoom / newZoom
+        double ratio = m_viewport.zoom / newZoom;
+        m_viewport.center_lon = cursorLon - (cursorLon - m_viewport.center_lon) * ratio;
+        m_viewport.center_lat = cursorLat - (cursorLat - m_viewport.center_lat) * ratio;
+        m_viewport.zoom = newZoom;
+    }
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::onMouseDrag(double dx, double dy) {
+    m_liveLoopPlaying = false;
+    if (m_liveLoopCount > 0)
+        m_liveLoopPlaybackIndex = m_liveLoopCount - 1;
+    m_liveLoopAccumulator = 0.0f;
+    if (m_crossSection) {
+        // Left-drag: grab and move the whole cross-section line
+        // dx positive = mouse right = lon increases
+        // dy positive = mouse down = lat decreases
+        float dlon = (float)(dx / m_viewport.zoom);
+        float dlat = (float)(-dy / m_viewport.zoom);
+        m_xsStartLat += dlat;
+        m_xsStartLon += dlon;
+        m_xsEndLat += dlat;
+        m_xsEndLon += dlon;
+    } else {
+        m_viewport.center_lon -= dx / m_viewport.zoom;
+        m_viewport.center_lat += dy / m_viewport.zoom;
+        invalidateFrameCache(true);
+    }
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::onMouseMove(double mx, double my) {
+    // Convert mouse pixel to lat/lon
+    m_mouseLon = (float)(m_viewport.center_lon + (mx - m_viewport.width * 0.5) / m_viewport.zoom);
+    m_mouseLat = (float)(m_viewport.center_lat - (my - m_viewport.height * 0.5) / m_viewport.zoom);
+
+    if (!m_autoTrackStation)
+        return;
+
+    // Find nearest uploaded station
+    float bestDist = 1e9f;
+    int bestIdx = -1;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            if (!m_stations[i].uploaded) continue;
+            float dlat = m_mouseLat - m_stations[i].gpuInfo.lat;
+            float dlon = (m_mouseLon - m_stations[i].gpuInfo.lon) *
+                         cosf(m_stations[i].gpuInfo.lat * 3.14159f / 180.0f);
+            float dist = dlat * dlat + dlon * dlon;
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = i;
+            }
+        }
+    }
+
+    if (bestIdx != m_activeStationIdx && bestIdx >= 0) {
+        m_activeStationIdx = bestIdx;
+        invalidateLiveLoop(false);
+        bool needsUpload = false;
+        bool hasLocalLoopHistory = false;
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            needsUpload = !stationUploadMatchesSelection(m_stations[bestIdx]);
+            hasLocalLoopHistory = !m_stations[bestIdx].live_history.empty();
+        }
+        if (needsUpload)
+            uploadStation(bestIdx);
+        if (!m_snapshotMode && !m_historicMode)
+            queueLiveStationRefresh(bestIdx, true);
+        if (hasLocalLoopHistory && m_liveLoopEnabled && !m_snapshotMode && !m_historicMode && !m_showAll)
+            requestLiveLoopBackfill();
+        m_needsRerender = true;
+        m_needsComposite = true;
+    }
+}
+
+std::string App::activeStationName() const {
+    std::lock_guard<std::mutex> lock(m_stationMutex);
+    if (m_activeStationIdx < 0 || m_activeStationIdx >= m_stationsTotal)
+        return "None";
+    return m_stations[m_activeStationIdx].icao;
+}
+
+void App::selectStation(int idx, bool centerView, double zoom) {
+    if (idx < 0 || idx >= m_stationsTotal)
+        return;
+
+    const bool stationChanged = (idx != m_activeStationIdx);
+    m_activeStationIdx = idx;
+    m_autoTrackStation = false;
+    if (stationChanged)
+        invalidateLiveLoop(false);
+
+    if (centerView) {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (idx < (int)m_stations.size()) {
+            const auto& st = m_stations[idx];
+            m_viewport.center_lat = st.gpuInfo.lat != 0.0f ? st.gpuInfo.lat : st.lat;
+            m_viewport.center_lon = st.gpuInfo.lon != 0.0f ? st.gpuInfo.lon : st.lon;
+            if (zoom > 0.0)
+                m_viewport.zoom = zoom;
+        }
+    }
+
+    bool needsUpload = false;
+    bool hasLocalLoopHistory = false;
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        if (idx < (int)m_stations.size()) {
+            needsUpload = !stationUploadMatchesSelection(m_stations[idx]);
+            hasLocalLoopHistory = !m_stations[idx].live_history.empty();
+        }
+    }
+    if (needsUpload)
+        uploadStation(idx);
+    if (!m_snapshotMode && !m_historicMode)
+        queueLiveStationRefresh(idx, true);
+    if (stationChanged && hasLocalLoopHistory &&
+        m_liveLoopEnabled && !m_snapshotMode && !m_historicMode && !m_showAll)
+        requestLiveLoopBackfill();
+
+    refreshActiveTiltMetadata();
+    if (m_crossSection || m_mode3D)
+        rebuildVolumeForCurrentSelection();
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::onResize(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    m_windowWidth = w;
+    m_windowHeight = h;
+    m_viewport.width = w;
+    m_viewport.height = h;
+
+    // Resize compositor output
+    m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:(size_t)w * h * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+
+    ensureCrossSectionBuffer(w, std::max(200, h / 3));
+    invalidateFrameCache(true);
+    m_outputTex.resize(w, h);
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::setProduct(int p) {
+    if (p < 0 || p >= (int)Product::COUNT) return;
+    if (p == m_activeProduct) return;
+    m_activeProduct = p;
+    m_activeTilt = 0; // reset tilt - different products have different valid tilts
+    m_lastHistoricFrame = -1; // force re-upload in historic mode
+    m_maxTilts = 1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+
+    if (m_historicMode) {
+        if (m_crossSection || m_mode3D)
+            rebuildVolumeForCurrentSelection();
+    } else {
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            uploadStation(i);
+        }
+        if (m_crossSection || m_mode3D)
+            rebuildVolumeForCurrentSelection();
+    }
+    refreshActiveTiltMetadata();
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
+}
+
+void App::nextProduct() { setProduct((m_activeProduct + 1) % (int)Product::COUNT); }
+void App::prevProduct() { setProduct((m_activeProduct - 1 + (int)Product::COUNT) % (int)Product::COUNT); }
+
+void App::setTilt(int t) {
+    m_maxTilts = currentAvailableTilts();
+    if (t < 0) t = 0;
+    if (t >= m_maxTilts) t = m_maxTilts - 1;
+    if (t == m_activeTilt) {
+        refreshActiveTiltMetadata();
+        return;
+    }
+    m_activeTilt = t;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
+
+    if (m_historicMode) {
+        m_lastHistoricFrame = -1; // force re-upload with new tilt
+    } else {
+        // Re-upload all stations with new tilt
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            uploadStation(i);
+        }
+        for (int i = 0; i < (int)m_stations.size(); i++) {
+            m_renderer->syncStation(i);
+        }
+    }
+    if (m_crossSection || m_mode3D)
+        rebuildVolumeForCurrentSelection();
+    refreshActiveTiltMetadata();
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
+    m_needsRerender = true;
+}
+
+void App::nextTilt() { setTilt(m_activeTilt + 1); }
+void App::prevTilt() { setTilt(m_activeTilt - 1); }
+
+void App::setDbzMinThreshold(float v) {
+    float* target = (m_activeProduct == PROD_VEL)
+        ? &m_velocityMinThreshold
+        : &m_dbzMinThreshold;
+    if (v == *target) return;
+    *target = v;
+    if (m_historicMode)
+        invalidateFrameCache(true);
+    m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
+}
+
+void App::onRightDrag(double dx, double dy) {
+    if (m_mode3D) {
+        m_camera.orbit_angle += (float)dx * 0.3f;
+        m_camera.tilt_angle -= (float)dy * 0.3f;
+        m_camera.tilt_angle = std::max(5.0f, std::min(85.0f, m_camera.tilt_angle));
+    } else if (m_crossSection) {
+        // Right-drag endpoint of cross-section line
+        m_xsEndLon = (float)(m_viewport.center_lon + (dx - m_viewport.width * 0.5) / m_viewport.zoom);
+        m_xsEndLat = (float)(m_viewport.center_lat - (dy - m_viewport.height * 0.5) / m_viewport.zoom);
+    }
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::onMiddleClick(double mx, double my) {
+    if (m_crossSection) {
+        m_xsStartLon = (float)(m_viewport.center_lon + (mx - m_viewport.width * 0.5) / m_viewport.zoom);
+        m_xsStartLat = (float)(m_viewport.center_lat - (my - m_viewport.height * 0.5) / m_viewport.zoom);
+        m_xsEndLon = m_xsStartLon;
+        m_xsEndLat = m_xsStartLat;
+        m_xsDragging = true;
+        m_needsRerender = true;
+        m_needsComposite = true;
+    }
+}
+
+void App::onMiddleDrag(double mx, double my) {
+    if (m_crossSection && m_xsDragging) {
+        m_xsEndLon = (float)(m_viewport.center_lon + (mx - m_viewport.width * 0.5) / m_viewport.zoom);
+        m_xsEndLat = (float)(m_viewport.center_lat - (my - m_viewport.height * 0.5) / m_viewport.zoom);
+        m_needsRerender = true;
+        m_needsComposite = true;
+    }
+}
+
+void App::toggleCrossSection() {
+    m_crossSection = !m_crossSection;
+    m_mode3D = false;
+    m_xsDragging = false;
+    invalidateFrameCache(true);
+
+    if (m_crossSection && m_activeStationIdx >= 0) {
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            if (m_activeStationIdx < (int)m_stations.size()) {
+                const auto& st = m_stations[m_activeStationIdx];
+                const float sLat = (st.gpuInfo.lat != 0.0f) ? st.gpuInfo.lat : st.lat;
+                const float sLon = (st.gpuInfo.lon != 0.0f) ? st.gpuInfo.lon : st.lon;
+                m_xsStartLat = sLat - 1.5f;
+                m_xsStartLon = sLon - 1.5f;
+                m_xsEndLat = sLat + 1.5f;
+                m_xsEndLon = sLon + 1.5f;
+            }
+        }
+        rebuildVolumeForCurrentSelection();
+    }
+
+    m_needsRerender = true;
+    printf("Cross-section: %s\n", m_crossSection ? "ON" : "OFF");
+}
+
+void App::toggle3D() {
+    // Disabled in Metal port — not yet stable
+}
+
+void App::toggleSRV() {
+    m_srvMode = !m_srvMode;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
+}
+
+void App::setStormMotion(float speed, float dir) {
+    m_stormSpeed = speed;
+    m_stormDir = dir;
+    invalidateFrameCache(true);
+    m_needsRerender = true;
+    if (m_liveLoopEnabled && !m_historicMode && !m_snapshotMode && !m_showAll)
+        requestLiveLoopBackfill();
+}
+
+void App::rerenderAll() {
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::loadHistoricEvent(int idx) {
+    m_historicMode = true;
+    m_autoTrackStation = false;
+    m_showAll = false;
+    m_snapshotMode = false;
+    m_snapshotLowestSweepOnly = false;
+    m_snapshotLabel.clear();
+    m_snapshotTimestampIso.clear();
+    m_lastHistoricFrame = -1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateLiveLoop(false);
+    invalidateFrameCache(true);
+    m_warnings.clearHistoric();
+    m_historic.loadEvent(idx);
+    // Center viewport on the event
+    if (idx >= 0 && idx < NUM_HISTORIC_EVENTS) {
+        m_viewport.center_lat = HISTORIC_EVENTS[idx].center_lat;
+        m_viewport.center_lon = HISTORIC_EVENTS[idx].center_lon;
+        m_viewport.zoom = HISTORIC_EVENTS[idx].zoom;
+    }
+}
+
+bool App::loadArchiveRange(const std::string& station,
+                           int year, int month, int day,
+                           int startHour, int startMin,
+                           int endHour, int endMin) {
+    const std::string stationCode = normalizeStationCode(station);
+    const int stationIdx = findStationIndexByCode(stationCode);
+    if (stationIdx < 0) {
+        std::printf("Archive request rejected: unknown station '%s'\n", station.c_str());
+        return false;
+    }
+    if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month) ||
+        startHour < 0 || startHour > 23 || endHour < 0 || endHour > 23 ||
+        startMin < 0 || startMin > 59 || endMin < 0 || endMin > 59) {
+        std::printf("Archive request rejected: invalid date/time range\n");
+        return false;
+    }
+
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_historic.cancel();
+    m_historicMode = true;
+    m_autoTrackStation = false;
+    m_showAll = false;
+    m_snapshotMode = false;
+    m_snapshotLowestSweepOnly = false;
+    m_snapshotLabel.clear();
+    m_snapshotTimestampIso.clear();
+    m_lastHistoricFrame = -1;
+    m_volumeBuilt = false;
+    m_volumeStation = -1;
+    invalidateFrameCache(true);
+    m_warnings.clearHistoric();
+
+    const auto& site = NEXRAD_STATIONS[stationIdx];
+    m_viewport.center_lat = site.lat;
+    m_viewport.center_lon = site.lon;
+    m_viewport.zoom = 180.0;
+
+    const std::string label = makeArchiveRangeLabel(stationCode, year, month, day,
+                                                    startHour, startMin, endHour, endMin);
+    return m_historic.loadRange(label, stationCode, year, month, day,
+                                startHour, startMin, endHour, endMin);
+}
+
+void App::uploadHistoricFrame(int frameIdx) {
+    const RadarFrame* fr = m_historic.frame(frameIdx);
+    if (!fr || !fr->ready || fr->sweeps.empty()) return;
+
+    int slot = 0;
+    // Filter by active product
+    int productTilts = countProductSweeps(fr->sweeps, m_activeProduct);
+    if (productTilts <= 0) {
+        m_renderer->freeStation(slot);
+        m_volumeBuilt = false;
+        m_volumeStation = -1;
+        return;
+    }
+    if (m_activeTilt >= productTilts) m_activeTilt = productTilts - 1;
+    int sweepIdx = findProductSweep(fr->sweeps, m_activeProduct, m_activeTilt);
+    auto& pc = fr->sweeps[sweepIdx];
+    if (pc.num_radials == 0) return;
+
+    m_maxTilts = productTilts;
+
+    GpuStationInfo info = {};
+    info.lat = fr->station_lat;
+    info.lon = fr->station_lon;
+    info.elevation_angle = pc.elevation_angle;
+    info.num_radials = pc.num_radials;
+
+    for (int p = 0; p < NUM_PRODUCTS; p++) {
+        auto& pd = pc.products[p];
+        if (!pd.has_data) continue;
+        info.has_product[p] = true;
+        info.num_gates[p] = pd.num_gates;
+        info.first_gate_km[p] = pd.first_gate_km;
+        info.gate_spacing_km[p] = pd.gate_spacing_km;
+        info.scale[p] = pd.scale;
+        info.offset[p] = pd.offset;
+    }
+
+    m_renderer->allocateStation(slot, info);
+    const uint16_t* gatePtrs[NUM_PRODUCTS] = {};
+    for (int p = 0; p < NUM_PRODUCTS; p++)
+        if (pc.products[p].has_data && !pc.products[p].gates.empty())
+            gatePtrs[p] = pc.products[p].gates.data();
+    m_renderer->uploadStationData(slot, info, pc.azimuths.data(), gatePtrs);
+    m_renderer->syncStation(slot);
+
+    // Update station state for rendering
+    if (m_stations.size() > 0) {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        m_stations[0].gpuInfo = info;
+        m_stations[0].uploaded = true;
+        m_stations[0].uploaded_product = m_activeProduct;
+        m_stations[0].uploaded_tilt = m_activeTilt;
+        m_stations[0].uploaded_sweep = sweepIdx;
+        m_stations[0].uploaded_lowest_sweep = false;
+        m_stations[0].gpuInfo.lat = fr->station_lat;
+        m_stations[0].gpuInfo.lon = fr->station_lon;
+    }
+    m_activeStationIdx = 0;
+    m_activeTiltAngle = pc.elevation_angle;
+
+    if (m_crossSection || m_mode3D)
+        rebuildVolumeForCurrentSelection();
+}
+
+// (Demo pack methods removed)
+
+void App::waitForGpu() {
+    if (m_renderer) m_renderer->waitForGpu();
+}
+
+void App::refreshData() {
+    printf("Refreshing data from AWS...\n");
+    const bool clearExistingScene = m_snapshotMode || m_historicMode;
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_autoTrackStation = true;
+    m_historic.cancel();
+    m_historicMode = false;
+    m_warnings.clearHistoric();
+    invalidateLiveLoop(false);
+
+    if (clearExistingScene) {
+        {
+            std::lock_guard<std::mutex> lock(m_stationMutex);
+            ++m_downloadGeneration;
+            m_snapshotMode = false;
+            m_snapshotLowestSweepOnly = false;
+            m_snapshotLabel.clear();
+            m_snapshotTimestampIso.clear();
+        }
+        if (m_singleStationMode) {
+            // iOS: just refresh active station, don't reset everything
+            queueLiveStationRefresh(m_activeStationIdx, true);
+            return;
+        }
+        resetStationsForReload();
+        startDownloads();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        ++m_downloadGeneration;
+        m_snapshotMode = false;
+        m_snapshotLowestSweepOnly = false;
+        m_snapshotLabel.clear();
+        m_snapshotTimestampIso.clear();
+        m_stationsDownloading = 0;
+
+        // Keep current rendered data visible until replacement downloads arrive.
+        for (auto& st : m_stations) {
+            st.downloading = false;
+            st.failed = false;
+            st.error.clear();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_uploadMutex);
+        m_uploadQueue.clear();
+    }
+    startDownloads();
+}
+
+void App::loadMarch302025Snapshot(bool lowestSweepOnly) {
+    printf("Loading all-site archive snapshot for 2025-03-30 21:00 UTC%s...\n",
+           lowestSweepOnly ? " (lowest sweep only)" : "");
+    m_lastRefresh = std::chrono::steady_clock::now();
+    m_historic.cancel();
+    m_historicMode = false;
+    m_autoTrackStation = true;
+    m_snapshotMode = true;
+    m_snapshotLowestSweepOnly = lowestSweepOnly;
+    m_snapshotLabel = lowestSweepOnly
+        ? "Mar 30 2025 5 PM ET (Lowest Sweep)"
+        : "Mar 30 2025 5 PM ET";
+    m_snapshotTimestampIso = makeIsoUtcTimestamp(2025, 3, 30, 21, 0);
+    m_showAll = true;
+    m_mode3D = false;
+    m_crossSection = false;
+    m_viewport.center_lat = 39.0;
+    m_viewport.center_lon = -98.0;
+    m_viewport.zoom = 28.0;
+    m_warnings.clearHistoric();
+    {
+        std::lock_guard<std::mutex> lock(m_stationMutex);
+        ++m_downloadGeneration;
+    }
+    invalidateFrameCache(true);
+    resetStationsForReload();
+    startDownloadsForTimestamp(2025, 3, 30, 21, 0);
+}
+
+// -- Detection computation (TDS, Hail, Mesocyclone) ----------
+
+void App::computeDetection(int stationIdx) {
+    auto& st = m_stations[stationIdx];
+    if (st.precomputed.empty()) return;
+    auto& det = st.detection;
+    det.tds.clear();
+    det.hail.clear();
+    det.meso.clear();
+    det.computed = true;
+
+    float slat = st.gpuInfo.lat != 0 ? st.gpuInfo.lat : (st.data_lat != 0.0f ? st.data_lat : st.lat);
+    float slon = st.gpuInfo.lon != 0 ? st.gpuInfo.lon : (st.data_lon != 0.0f ? st.data_lon : st.lon);
+    float cos_lat = std::max(cosf(slat * kDegToRad), 0.1f);
+
+    int refSweep = -1, ccSweep = -1, zdrSweep = -1, velSweep = -1;
+    for (int s = 0; s < (int)st.precomputed.size(); s++) {
+        auto& pc = st.precomputed[s];
+        if (pc.elevation_angle > 1.5f) continue; // only lowest tilts
+        if (pc.products[PROD_REF].has_data && refSweep < 0) refSweep = s;
+        if (pc.products[PROD_CC].has_data && ccSweep < 0) ccSweep = s;
+        if (pc.products[PROD_ZDR].has_data && zdrSweep < 0) zdrSweep = s;
+        if (pc.products[PROD_VEL].has_data && velSweep < 0) velSweep = s;
+    }
+
+    // -- TDS: CC < 0.80, REF > 35 dBZ, |ZDR| < 1.0 --
+    if (ccSweep >= 0 && zdrSweep >= 0 && refSweep >= 0) {
+        auto& ccPc = st.precomputed[ccSweep];
+        auto& zdrPc = st.precomputed[zdrSweep];
+        auto& refPc = st.precomputed[refSweep];
+        auto& ccPd = ccPc.products[PROD_CC];
+        auto& zdrPd = zdrPc.products[PROD_ZDR];
+        auto& refPd = refPc.products[PROD_REF];
+
+        int nr = ccPc.num_radials;
+        int ng = ccPd.num_gates;
+        if (nr > 0 && ng > 0) {
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, std::numeric_limits<float>::infinity());
+
+            for (int ri = 0; ri < nr; ++ri) {
+                int zdr_ri = std::min((int)((int64_t)ri * zdrPc.num_radials / std::max(nr, 1)),
+                                      std::max(zdrPc.num_radials - 1, 0));
+                int ref_ri = std::min((int)((int64_t)ri * refPc.num_radials / std::max(nr, 1)),
+                                      std::max(refPc.num_radials - 1, 0));
+                for (int gi = 0; gi < ng; gi += 2) {
+                    float range_km = ccPd.first_gate_km + gi * ccPd.gate_spacing_km;
+                    if (range_km < 15.0f || range_km > 120.0f) continue;
+
+                    float cc = decodeGateValue(ccPd, nr, gi, ri);
+                    if (cc == kInvalidSample || cc < 0.55f || cc > 0.82f) continue;
+
+                    int zdr_gi = gateIndexForRange(zdrPd, range_km);
+                    int ref_gi = gateIndexForRange(refPd, range_km);
+                    if (zdr_gi < 0 || ref_gi < 0) continue;
+
+                    float zdr = decodeGateValue(zdrPd, zdrPc.num_radials, zdr_gi, zdr_ri);
+                    float ref = decodeGateValue(refPd, refPc.num_radials, ref_gi, ref_ri);
+                    if (zdr == kInvalidSample || ref == kInvalidSample) continue;
+                    if (fabsf(zdr) > 1.25f || ref < 40.0f) continue;
+
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = cc;
+                }
+            }
+
+            for (int ri = 0; ri < nr; ++ri) {
+                float az_rad = ccPc.azimuths[ri] * kDegToRad;
+                for (int gi = 0; gi < ng; gi += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 2) < 6) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 2, true)) continue;
+
+                    float range_km = ccPd.first_gate_km + gi * ccPd.gate_spacing_km;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.tds.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMarkers(det.tds, 8.0f, 12, true);
+        }
+    }
+
+    // -- Hail: HDR = Z - (19*ZDR + 27), mark where HDR > 0 --
+    if (refSweep >= 0 && zdrSweep >= 0) {
+        auto& refPc = st.precomputed[refSweep];
+        auto& zdrPc = st.precomputed[zdrSweep];
+        auto& refPd = refPc.products[PROD_REF];
+        auto& zdrPd = zdrPc.products[PROD_ZDR];
+
+        int nr = refPc.num_radials;
+        int ng = refPd.num_gates;
+        if (nr > 0 && ng > 0) {
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, -std::numeric_limits<float>::infinity());
+
+            for (int ri = 0; ri < nr; ++ri) {
+                int zdr_ri = std::min((int)((int64_t)ri * zdrPc.num_radials / std::max(nr, 1)),
+                                      std::max(zdrPc.num_radials - 1, 0));
+                for (int gi = 0; gi < ng; gi += 2) {
+                    float range_km = refPd.first_gate_km + gi * refPd.gate_spacing_km;
+                    if (range_km < 15.0f || range_km > 180.0f) continue;
+
+                    float ref = decodeGateValue(refPd, nr, gi, ri);
+                    if (ref == kInvalidSample || ref < 55.0f) continue;
+
+                    int zdr_gi = gateIndexForRange(zdrPd, range_km);
+                    if (zdr_gi < 0) continue;
+                    float zdr = decodeGateValue(zdrPd, zdrPc.num_radials, zdr_gi, zdr_ri);
+                    if (zdr == kInvalidSample) continue;
+
+                    float hdr = ref - (19.0f * std::max(zdr, 0.0f) + 27.0f);
+                    if (hdr < 10.0f) continue;
+
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = hdr;
+                }
+            }
+
+            for (int ri = 0; ri < nr; ++ri) {
+                float az_rad = refPc.azimuths[ri] * kDegToRad;
+                for (int gi = 0; gi < ng; gi += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 2) < 5) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 2, false)) continue;
+
+                    float range_km = refPd.first_gate_km + gi * refPd.gate_spacing_km;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.hail.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMarkers(det.hail, 10.0f, 16, false);
+        }
+    }
+
+    // -- Mesocyclone: azimuthal shear in velocity data --
+    if (velSweep >= 0) {
+        auto& velPc = st.precomputed[velSweep];
+        auto& velPd = velPc.products[PROD_VEL];
+        int nr = velPc.num_radials;
+        int ng = velPd.num_gates;
+
+        if (nr >= 10 && ng >= 10) {
+            std::vector<uint8_t> candidate((size_t)nr * ng, 0);
+            std::vector<float> score((size_t)nr * ng, -std::numeric_limits<float>::infinity());
+            std::vector<float> diameter((size_t)nr * ng, 0.0f);
+
+            auto passesMesoGate = [&](int gate_idx, int radial_idx,
+                                      float range_km, float* shear_out,
+                                      float* span_out) -> bool {
+                int span = 2;
+                int ri_lo = (radial_idx - span + nr) % nr;
+                int ri_hi = (radial_idx + span) % nr;
+
+                float v_lo = decodeGateValue(velPd, nr, gate_idx, ri_lo);
+                float v_hi = decodeGateValue(velPd, nr, gate_idx, ri_hi);
+                if (v_lo == kInvalidSample || v_hi == kInvalidSample) return false;
+                if (fabsf(v_lo) < 12.0f || fabsf(v_hi) < 12.0f) return false;
+                if (v_lo * v_hi >= 0.0f) return false;
+
+                float shear_ms = fabsf(v_hi - v_lo);
+                if (shear_ms < 40.0f) return false;
+
+                float az_span_deg = span * 2.0f * (360.0f / nr);
+                float az_span_km = range_km * az_span_deg * kDegToRad;
+                if (az_span_km < 1.0f || az_span_km > 10.0f) return false;
+
+                *shear_out = shear_ms;
+                *span_out = az_span_km;
+                return true;
+            };
+
+            for (int gi = 12; gi < ng - 12; gi += 4) {
+                float range_km = velPd.first_gate_km + gi * velPd.gate_spacing_km;
+                if (range_km < 20.0f || range_km > 120.0f) continue;
+
+                for (int ri = 0; ri < nr; ri += 2) {
+                    if (refSweep >= 0) {
+                        auto& refPc = st.precomputed[refSweep];
+                        auto& refPd = refPc.products[PROD_REF];
+                        int ref_ri = std::min((int)((int64_t)ri * refPc.num_radials / std::max(nr, 1)),
+                                              std::max(refPc.num_radials - 1, 0));
+                        int ref_gi = gateIndexForRange(refPd, range_km);
+                        float ref = decodeGateValue(refPd, refPc.num_radials, ref_gi, ref_ri);
+                        if (ref == kInvalidSample || ref < 35.0f) continue;
+                    }
+
+                    float shear_ms = 0.0f;
+                    float az_span_km = 0.0f;
+                    if (!passesMesoGate(gi, ri, range_km, &shear_ms, &az_span_km)) continue;
+
+                    int gate_support = 0;
+                    for (int dgi = -2; dgi <= 2; ++dgi) {
+                        int ngi = gi + dgi;
+                        if (ngi < 0 || ngi >= ng) continue;
+                        float neighbor_shear = 0.0f;
+                        float neighbor_span = 0.0f;
+                        float neighbor_range = velPd.first_gate_km + ngi * velPd.gate_spacing_km;
+                        if (passesMesoGate(ngi, ri, neighbor_range, &neighbor_shear, &neighbor_span))
+                            ++gate_support;
+                    }
+                    if (gate_support < 3) continue;
+
+                    candidate[(size_t)gi * nr + ri] = 1;
+                    score[(size_t)gi * nr + ri] = shear_ms;
+                    diameter[(size_t)gi * nr + ri] = az_span_km;
+                }
+            }
+
+            for (int gi = 12; gi < ng - 12; gi += 4) {
+                for (int ri = 0; ri < nr; ri += 2) {
+                    if (!candidate[(size_t)gi * nr + ri]) continue;
+                    if (countCandidateSupport(candidate, nr, ng, ri, gi, 2, 1) < 3) continue;
+                    if (!isLocalExtremum(score, candidate, nr, ng, ri, gi, 2, 1, false)) continue;
+
+                    float range_km = velPd.first_gate_km + gi * velPd.gate_spacing_km;
+                    float az_rad = velPc.azimuths[ri] * kDegToRad;
+                    float east_km = range_km * sinf(az_rad);
+                    float north_km = range_km * cosf(az_rad);
+                    det.meso.push_back({
+                        slat + north_km / 111.0f,
+                        slon + east_km / (111.0f * cos_lat),
+                        score[(size_t)gi * nr + ri],
+                        diameter[(size_t)gi * nr + ri]
+                    });
+                }
+            }
+            clusterMesoMarkers(det.meso, 12.0f, 12);
+        }
+    }
+
+    printf("Detection [%s]: %d TDS, %d hail, %d meso\n",
+           st.icao.c_str(), (int)det.tds.size(), (int)det.hail.size(), (int)det.meso.size());
+}
+
+// -- Velocity dealiasing -----------------------------------------
+// Simple spatial-consistency dealiasing: if a gate's velocity jumps by
+// more than Vn (Nyquist) from its neighbors, unfold it.
+
+void App::dealias(int stationIdx) {
+    auto& st = m_stations[stationIdx];
+    if (st.precomputed.empty()) return;
+    dealiasPrecomputedSweeps(st.precomputed);
+}
+
+// -- All-tilt VRAM cache -----------------------------------------
+// Upload every sweep's data for all products to GPU. Tilt switching
+// becomes a pointer swap (zero re-upload).
+
+void App::uploadAllTilts(int stationIdx) {
+    auto& st = m_stations[stationIdx];
+    if (st.precomputed.empty()) return;
+
+    // Placeholder until per-sweep pointer caching is wired back in.
+    m_allTiltsCached = true;
+}
+
+void App::switchTiltCached(int stationIdx, int newTilt) {
+    // If we have all tilts cached, just swap pointers
+    // For now, fall back to re-upload (full cache TBD)
+    uploadStation(stationIdx);
+}
+
+// -- Pre-baked animation frame cache -----------------------------
+
+void App::cacheAnimFrame(int frameIdx, id<MTLBuffer> d_src, int w, int h) {
+    if (frameIdx >= MAX_CACHED_FRAMES) return;
+    if (w <= 0 || h <= 0) return;
+
+    if ((m_cachedFrameWidth != 0 || m_cachedFrameHeight != 0) &&
+        (m_cachedFrameWidth != w || m_cachedFrameHeight != h)) {
+        invalidateFrameCache(true);
+    }
+
+    m_cachedFrameWidth = w;
+    m_cachedFrameHeight = h;
+    size_t sz = (size_t)w * h * sizeof(uint32_t);
+    if (!m_cachedFrames[frameIdx]) {
+        m_cachedFrames[frameIdx] = [m_renderer->getDevice() newBufferWithLength:sz options:MTLResourceStorageModeShared];
+    }
+    memcpy(m_cachedFrames[frameIdx].contents, d_src.contents, sz);
+    if (frameIdx >= m_cachedFrameCount) m_cachedFrameCount = frameIdx + 1;
+}
