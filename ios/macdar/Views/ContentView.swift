@@ -25,6 +25,14 @@ struct ContentView: View {
         return Array(stations.prefix(4))
     }
 
+    private var isMacCatalystShell: Bool {
+#if targetEnvironment(macCatalyst)
+        true
+#else
+        false
+#endif
+    }
+
     var body: some View {
         ZStack {
             RadarMapView()
@@ -261,29 +269,46 @@ struct ContentView: View {
     }
 
     private func liveLoopStrip(_ liveLoop: RadarLiveLoopStatus) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("LIVE LOOP")
-                    .font(.system(size: 9, weight: .black, design: .monospaced))
-                    .tracking(1.2)
-                    .foregroundColor(radarChromeWarm.opacity(0.9))
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("LIVE LOOP")
+                        .font(.system(size: 9, weight: .black, design: .monospaced))
+                        .tracking(1.2)
+                        .foregroundColor(radarChromeWarm.opacity(0.9))
 
-                Text(liveLoopLabel(liveLoop))
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
+                    Text(liveLoopLabel(liveLoop))
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
 
-                Text(liveLoopStatusLine(liveLoop))
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.62))
-                    .lineLimit(1)
+                    Text(liveLoopStatusLine(liveLoop))
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.62))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                HStack(spacing: 8) {
+                    if isMacCatalystShell && liveLoop.availableFrames > 0 {
+                        let atLiveEdge = liveLoop.currentFrame >= max(liveLoop.availableFrames - 1, 0) && !liveLoop.playing
+                        chromeTextButton(title: "LIVE") {
+                            appState.goToLiveFrame()
+                        }
+                        .opacity(atLiveEdge ? 0.45 : 1.0)
+                        .disabled(atLiveEdge)
+                    }
+
+                    chromeTextButton(title: liveLoop.playing ? "PAUSE" : "PLAY") {
+                        appState.engine.toggleLiveLoopPlayback()
+                        appState.syncFromEngine()
+                    }
+                }
             }
 
-            Spacer(minLength: 0)
-
-            chromeTextButton(title: liveLoop.playing ? "PAUSE" : "PLAY") {
-                appState.engine.toggleLiveLoopPlayback()
-                appState.syncFromEngine()
+            if isMacCatalystShell && liveLoop.availableFrames > 1 {
+                liveLoopScrubber(liveLoop)
             }
         }
         .padding(.horizontal, 12)
@@ -311,12 +336,36 @@ struct ContentView: View {
     private func liveLoopStatusLine(_ liveLoop: RadarLiveLoopStatus) -> String {
         if liveLoop.loading {
             let frameCount = max(liveLoop.availableFrames, 0)
-            return "BACKFILLING \(frameCount)/8"
+            let target = max(liveLoop.targetFrames, frameCount)
+            return "BACKFILLING \(frameCount)/\(target)"
         }
 
         let modeLabel = liveLoop.playing ? "PLAYING" : "READY"
         let frameCount = max(liveLoop.availableFrames, 0)
-        return "\(modeLabel)  \(frameCount) FRAMES"
+        let target = max(liveLoop.targetFrames, frameCount)
+        return "\(modeLabel)  \(frameCount)/\(target)"
+    }
+
+    private func liveLoopScrubber(_ liveLoop: RadarLiveLoopStatus) -> some View {
+        let maxFrameIndex = max(liveLoop.availableFrames - 1, 1)
+        let currentFrameIndex = min(max(liveLoop.currentFrame, 0), maxFrameIndex)
+
+        return HStack(spacing: 10) {
+            Text("\(currentFrameIndex + 1)/\(liveLoop.availableFrames)")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.86))
+                .frame(width: 58, alignment: .leading)
+
+            Slider(
+                value: Binding(
+                    get: { Double(currentFrameIndex) },
+                    set: { appState.setLiveLoopFrame(Int($0.rounded())) }
+                ),
+                in: 0...Double(maxFrameIndex),
+                step: 1
+            )
+            .tint(radarChromeAccent)
+        }
     }
 
     private func metricTile(label: String, value: String) -> some View {

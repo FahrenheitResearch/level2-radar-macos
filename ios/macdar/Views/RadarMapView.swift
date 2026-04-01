@@ -167,6 +167,7 @@ struct RadarMapView: UIViewRepresentable {
 
     func updateUIView(_ uiView: UIView, context: Context) {
         context.coordinator.renderCoordinator?.isRendering = appState.isRendering
+        context.coordinator.renderCoordinator?.refreshInteractionPolicy()
         context.coordinator.syncOverlayFromAppState()
         context.coordinator.renderCoordinator?.requestDraw()
     }

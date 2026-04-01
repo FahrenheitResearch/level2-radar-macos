@@ -62,6 +62,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic) BOOL viewingHistory;
 @property (nonatomic) int currentFrame;
 @property (nonatomic) int availableFrames;
+@property (nonatomic) int targetFrames;
+@property (nonatomic) int maxFrames;
 @property (nonatomic) float playbackFPS;
 @property (nonatomic, copy) NSString *label;
 @end
@@ -152,6 +154,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)loadHistoricEvent:(int)idx;
 - (void)toggleArchivePlayback;
 - (void)toggleLiveLoopPlayback;
+- (void)setLiveLoopFrame:(int)frame;
+- (void)setLiveLoopLength:(int)frames;
+- (void)goToLiveLoopLatestFrame;
 - (void)setArchivePlaying:(BOOL)playing;
 - (void)setArchiveFrame:(int)frame;
 - (void)setArchivePlaybackSpeed:(float)fps;

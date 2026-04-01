@@ -4,8 +4,6 @@ import UIKit
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) var dismiss
-    @State private var multiRadar = false
-    @State private var maxStations: Double = 1
     @State private var dbzThreshold: Float = 5.0
     @State private var stormSpeed: Double = 15.0
     @State private var stormDir: Double = 225.0
@@ -34,22 +32,37 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     header
 
-                    sectionCard(title: "RADAR MODE", subtitle: "Keep device mode lean unless you explicitly want mosaic.") {
-                        settingToggle(title: "Multi-radar mosaic",
-                                      subtitle: "Loads and blends multiple nearby sites.",
-                                      isOn: $multiRadar)
-                            .onChange(of: multiRadar) { _, val in
-                                appState.setMosaicMode(val)
+                    sectionCard(title: "LIVE LOOP", subtitle: "Deeper loop caches use more memory, but give the Mac build more history to scrub.") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("BACKFILLED FRAMES")
+                                    .font(.system(size: 11, weight: .black, design: .monospaced))
+                                    .tracking(1.0)
+                                    .foregroundColor(.white.opacity(0.58))
+                                Spacer()
+                                Text("\(appState.liveLoopTargetFrames)")
+                                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.white)
                             }
 
-                        if multiRadar {
-                            sliderBlock(title: "MAX ACTIVE SITES",
-                                        valueText: "\(Int(maxStations))",
-                                        value: $maxStations,
-                                        range: 2...10,
-                                        step: 1) { val in
-                                appState.setMaxActiveStations(Int(val))
-                            }
+                            Slider(
+                                value: Binding(
+                                    get: { Double(appState.liveLoopTargetFrames) },
+                                    set: { appState.setLiveLoopLength(Int($0.rounded())) }
+                                ),
+                                in: Double(appState.supportsDesktopPerformanceControls ? 4 : 1)...Double(max(appState.liveLoopMaxFrames, appState.supportsDesktopPerformanceControls ? 4 : 1)),
+                                step: 1
+                            )
+                            .tint(radarChromeAccent)
+                        }
+
+                        if appState.supportsDesktopPerformanceControls {
+                            settingToggle(title: "Full-resolution pan and zoom",
+                                          subtitle: "Uses more GPU so the radar stays sharp while you interact on Mac.",
+                                          isOn: Binding(
+                                            get: { appState.prefersFullResolutionInteraction },
+                                            set: { appState.setFullResolutionInteraction($0) }
+                                          ))
                         }
                     }
 
@@ -233,10 +246,12 @@ struct SettingsView: View {
                     sectionCard(title: "ABOUT", subtitle: "Device-first Metal radar shell.") {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("MACDAR IOS")
+                                Text("LEVEL2 RADAR")
                                     .font(.system(size: 15, weight: .bold, design: .monospaced))
                                     .foregroundColor(.white)
-                                Text("SwiftUI shell with a fast Metal radar path")
+                                Text(appState.supportsDesktopPerformanceControls
+                                     ? "Mac Catalyst shell with a fast Metal radar path"
+                                     : "SwiftUI shell with a fast Metal radar path")
                                     .font(.system(size: 12, weight: .medium))
                                     .foregroundColor(.white.opacity(0.62))
                             }
@@ -260,8 +275,6 @@ struct SettingsView: View {
             }
         }
         .onAppear {
-            multiRadar = appState.mosaicMode
-            maxStations = Double(appState.maxActiveStations)
             dbzThreshold = appState.engine.dbzThreshold
             stormSpeed = Double(appState.engine.stormSpeed)
             stormDir = Double(appState.engine.stormDir)

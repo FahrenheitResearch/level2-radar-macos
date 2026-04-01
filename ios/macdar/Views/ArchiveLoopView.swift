@@ -69,7 +69,7 @@ struct ArchiveLoopView: View {
     private var introCard: some View {
         sectionCard(
             title: "START A LOOP",
-            subtitle: "Load one of the built-in archive events to scrub, play, and inspect radar frames on iPhone."
+            subtitle: "Load one of the built-in archive events to scrub, play, and inspect radar frames."
         ) {
             Text("Archive playback keeps the same radar shell active while the engine downloads and decodes a preset Level II range in the background.")
                 .font(.system(size: 13, weight: .medium))

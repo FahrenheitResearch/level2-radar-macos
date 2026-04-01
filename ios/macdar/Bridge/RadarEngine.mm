@@ -834,6 +834,8 @@
         status.viewingHistory = _app->liveLoopViewingHistory() ? YES : NO;
         status.currentFrame = _app->liveLoopPlaybackFrame();
         status.availableFrames = _app->liveLoopAvailableFrames();
+        status.targetFrames = _app->liveLoopTargetFrames();
+        status.maxFrames = _app->liveLoopMaxFrames();
         status.playbackFPS = _app->liveLoopSpeed();
         std::string label = _app->liveLoopCurrentLabel();
         status.label = label.empty() ? @"" : [NSString stringWithUTF8String:label.c_str()];
@@ -861,6 +863,30 @@
     @synchronized (self) {
         if (!_initialized || _app->m_historicMode) return;
         _app->toggleLiveLoopPlayback();
+        _app->rerenderAll();
+    }
+}
+
+- (void)setLiveLoopFrame:(int)frame {
+    @synchronized (self) {
+        if (!_initialized || _app->m_historicMode) return;
+        _app->setLiveLoopPlaybackFrame(frame);
+        _app->rerenderAll();
+    }
+}
+
+- (void)setLiveLoopLength:(int)frames {
+    @synchronized (self) {
+        if (!_initialized || _app->m_historicMode) return;
+        _app->setLiveLoopLength(frames);
+        _app->rerenderAll();
+    }
+}
+
+- (void)goToLiveLoopLatestFrame {
+    @synchronized (self) {
+        if (!_initialized || _app->m_historicMode) return;
+        _app->goToLiveLoopLatestFrame();
         _app->rerenderAll();
     }
 }

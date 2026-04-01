@@ -6,110 +6,35 @@ cd "$(dirname "$0")"
 VERSION="${VERSION:-0.1.0}"
 APP_NAME="Level2 Radar"
 APP_BUNDLE="${APP_NAME}.app"
-EXECUTABLE_NAME="Level2Radar"
-BUNDLE_ID="com.fahrenheitresearch.level2radar"
 ZIP_NAME="level2-radar-macos.zip"
 DMG_NAME="level2-radar-macos.dmg"
-ENTITLEMENTS_PLIST="/tmp/level2-radar-entitlements.plist"
+DERIVED_DATA_PATH="${PWD}/build/catalyst-derived"
+PRODUCT_PATH="${DERIVED_DATA_PATH}/Build/Products/Release-maccatalyst/${APP_BUNDLE}"
 
-# Build first
-./build.sh
+rm -rf "$DERIVED_DATA_PATH" "$APP_BUNDLE"
+mkdir -p build
 
-rm -rf "$APP_BUNDLE"
+cd ios
+xcodegen generate
+xcodebuild \
+  -project macdar.xcodeproj \
+  -scheme macdar \
+  -configuration Release \
+  -derivedDataPath "$DERIVED_DATA_PATH" \
+  -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+  build \
+  CODE_SIGNING_ALLOWED=NO
+cd ..
 
-# Create .app bundle structure
-mkdir -p "$APP_BUNDLE/Contents/MacOS"
-mkdir -p "$APP_BUNDLE/Contents/Resources"
+cp -R "$PRODUCT_PATH" "$APP_BUNDLE"
 
-# Copy binary
-cp build/macdar "$APP_BUNDLE/Contents/MacOS/$EXECUTABLE_NAME"
-
-# Copy metallib if it exists
-if [ -f build/default.metallib ]; then
-    cp build/default.metallib "$APP_BUNDLE/Contents/MacOS/default.metallib"
-fi
-
-# Copy shader sources as fallback (for runtime compilation)
-mkdir -p "$APP_BUNDLE/Contents/Resources/shaders"
-cp src/metal/metal_common.h "$APP_BUNDLE/Contents/Resources/shaders/"
-cp src/metal/renderer.metal "$APP_BUNDLE/Contents/Resources/shaders/"
-cp src/metal/volume3d.metal "$APP_BUNDLE/Contents/Resources/shaders/"
-cp src/metal/gpu_pipeline.metal "$APP_BUNDLE/Contents/Resources/shaders/"
-
-cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key>
-    <string>${EXECUTABLE_NAME}</string>
-    <key>CFBundleIdentifier</key>
-    <string>${BUNDLE_ID}</string>
-    <key>CFBundleName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleDisplayName</key>
-    <string>${APP_NAME}</string>
-    <key>CFBundleVersion</key>
-    <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>14.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <key>NSAppTransportSecurity</key>
-    <dict>
-        <key>NSAllowsArbitraryLoads</key>
-        <true/>
-    </dict>
-</dict>
-</plist>
-PLIST
-
-cat > "$ENTITLEMENTS_PLIST" <<'ENT'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <true/>
-    <key>com.apple.security.network.client</key>
-    <true/>
-</dict>
-</plist>
-ENT
-
-IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
-if [ -z "$IDENTITY" ]; then
-    IDENTITY=$(security find-identity -v -p codesigning | grep "Apple Development" | head -1 | sed 's/.*"\(.*\)"/\1/')
-fi
-
-if [ -z "$IDENTITY" ]; then
-    echo "No signing identity found. Ad-hoc signing..."
-    codesign --force --deep -s - "$APP_BUNDLE"
+if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
+  IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed 's/.*"\(.*\)"/\1/')
+  echo "Signing with: $IDENTITY"
+  codesign --force --deep --options runtime -s "$IDENTITY" "$APP_BUNDLE"
 else
-    echo "Signing with: $IDENTITY"
-    codesign --force --deep --options runtime \
-        --entitlements "$ENTITLEMENTS_PLIST" \
-        -s "$IDENTITY" "$APP_BUNDLE"
-fi
-
-if xcrun notarytool history --keychain-profile "level2-radar-macos" &>/dev/null; then
-    echo ""
-    echo "Submitting for notarization..."
-    ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_NAME"
-    xcrun notarytool submit "$ZIP_NAME" --keychain-profile "level2-radar-macos" --wait
-    echo "Stapling notarization ticket..."
-    xcrun stapler staple "$APP_BUNDLE"
-else
-    echo ""
-    echo "Skipping notarization (no keychain profile 'level2-radar-macos' found)."
+  echo "No Developer ID identity found. Ad-hoc signing..."
+  codesign --force --deep -s - "$APP_BUNDLE"
 fi
 
 rm -f "$ZIP_NAME" "$DMG_NAME"

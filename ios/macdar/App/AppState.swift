@@ -10,6 +10,8 @@ private enum AppPreferenceKey {
     static let lastTilt = "macdar.lastTilt"
     static let mosaicMode = "macdar.mosaicMode"
     static let maxActiveStations = "macdar.maxActiveStations"
+    static let liveLoopLength = "macdar.liveLoopLength"
+    static let fullResolutionInteraction = "macdar.fullResolutionInteraction"
     static let dbzThreshold = "macdar.dbzThreshold"
     static let srvMode = "macdar.srvMode"
     static let stormSpeed = "macdar.stormSpeed"
@@ -81,10 +83,13 @@ class AppState: ObservableObject {
     @Published var cursorLon: Double = -98.0
     @Published var archiveStatus: RadarArchiveStatus?
     @Published var liveLoopStatus: RadarLiveLoopStatus?
+    @Published var liveLoopTargetFrames: Int = 8
+    @Published var liveLoopMaxFrames: Int = 16
     @Published var historicEvents: [RadarHistoricEventInfo] = []
     @Published var warningCount: Int = 0
     @Published var favoriteStationICAOs: [String]
     @Published var recentStationICAOs: [String]
+    @Published var prefersFullResolutionInteraction: Bool = false
     @Published var activeStationSweepCount: Int = 0
     @Published var activeStationLowestElevation: Float = 0.5
     @Published var activeStationTDSCount: Int = 0
@@ -111,6 +116,14 @@ class AppState: ObservableObject {
 
         if defaults.contains(key: AppPreferenceKey.maxActiveStations) {
             _maxActiveStations = Published(initialValue: max(1, defaults.integer(forKey: AppPreferenceKey.maxActiveStations)))
+        }
+
+        if defaults.contains(key: AppPreferenceKey.liveLoopLength) {
+            _liveLoopTargetFrames = Published(initialValue: max(1, defaults.integer(forKey: AppPreferenceKey.liveLoopLength)))
+        }
+
+        if defaults.contains(key: AppPreferenceKey.fullResolutionInteraction) {
+            _prefersFullResolutionInteraction = Published(initialValue: defaults.bool(forKey: AppPreferenceKey.fullResolutionInteraction))
         }
 
         device = MTLCreateSystemDefaultDevice()!
@@ -140,6 +153,14 @@ class AppState: ObservableObject {
         favoriteStationICAOs.compactMap { icao in
             stations.first { $0.icao == icao }
         }
+    }
+
+    var supportsDesktopPerformanceControls: Bool {
+#if targetEnvironment(macCatalyst)
+        true
+#else
+        false
+#endif
     }
 
     func initialize(width: Int, height: Int) {
@@ -177,6 +198,8 @@ class AppState: ObservableObject {
         archiveStatus = archive
         let liveLoop = engine.liveLoopStatus()
         liveLoopStatus = liveLoop
+        liveLoopTargetFrames = max(1, Int(liveLoop.targetFrames))
+        liveLoopMaxFrames = max(liveLoopTargetFrames, Int(liveLoop.maxFrames))
 
         if archive.active {
             clearActiveStationSignal()
@@ -257,6 +280,31 @@ class AppState: ObservableObject {
         defaults.set(clamped, forKey: AppPreferenceKey.maxActiveStations)
         engine.maxActiveStations = Int32(clamped)
         syncFromEngine()
+    }
+
+    func setLiveLoopLength(_ count: Int) {
+        let minimum = supportsDesktopPerformanceControls ? 4 : 1
+        let clamped = min(max(count, minimum), max(liveLoopMaxFrames, minimum))
+        liveLoopTargetFrames = clamped
+        defaults.set(clamped, forKey: AppPreferenceKey.liveLoopLength)
+        engine.setLiveLoopLength(Int32(clamped))
+        syncFromEngine()
+    }
+
+    func setLiveLoopFrame(_ frame: Int) {
+        engine.setLiveLoopFrame(Int32(frame))
+        syncFromEngine()
+    }
+
+    func goToLiveFrame() {
+        engine.goToLiveLoopLatestFrame()
+        syncFromEngine()
+    }
+
+    func setFullResolutionInteraction(_ enabled: Bool) {
+        guard supportsDesktopPerformanceControls else { return }
+        prefersFullResolutionInteraction = enabled
+        defaults.set(enabled, forKey: AppPreferenceKey.fullResolutionInteraction)
     }
 
     func setDbzThreshold(_ value: Float) {
@@ -438,6 +486,7 @@ class AppState: ObservableObject {
 
         engine.mosaicMode = mosaicMode
         engine.maxActiveStations = Int32(maxActiveStations)
+        engine.setLiveLoopLength(Int32(liveLoopTargetFrames))
 
         if defaults.contains(key: AppPreferenceKey.dbzThreshold) {
             engine.dbzThreshold = defaults.float(forKey: AppPreferenceKey.dbzThreshold)

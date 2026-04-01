@@ -44,7 +44,7 @@
 		0D05A24099BA8753B1265F60 /* color_table.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = color_table.cpp; sourceTree = "<group>"; };
 		12EA69028CFF51E1DA93AADB /* warnings.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = warnings.cpp; sourceTree = "<group>"; };
 		162E57FF3311DEC2B237A4B3 /* MetEngineBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MetEngineBridge.h; sourceTree = "<group>"; };
-		197A675C6C6234CAFD90664D /* macdar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = macdar.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		197A675C6C6234CAFD90664D /* macdar.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = macdar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		19BE94434DFF415B3E77E064 /* macdar-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "macdar-Bridging-Header.h"; sourceTree = "<group>"; };
 		2AD9431781C33A62EA2A936E /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		439A452E888E6A427096B803 /* RadarEngine.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = RadarEngine.mm; sourceTree = "<group>"; };
@@ -53,7 +53,7 @@
 		56392CF250C39188154F4E75 /* historic.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = historic.cpp; sourceTree = "<group>"; };
 		60925731FC982F8C14CFF10B /* renderer.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = renderer.metal; sourceTree = "<group>"; };
 		6134FF89D8B27EBCEE8E9FA2 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		638359A3B0E2EBE99E54CE9C /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		638359A3B0E2EBE99E54CE9C /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		68AAEA46D4DFE4395E18FF2D /* SoundingSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoundingSheetView.swift; sourceTree = "<group>"; };
 		74721D9BD77809E0DBC4FBAE /* RadarEngine.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RadarEngine.h; sourceTree = "<group>"; };
 		7CF94D31942E62FBF5897764 /* MetalRenderCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalRenderCoordinator.swift; sourceTree = "<group>"; };
@@ -243,6 +243,7 @@
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
 					B3D1E637D076F9AF5887F8D7 = {
+						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -353,6 +354,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = NO;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -372,21 +374,22 @@
 				);
 				INFOPLIST_FILE = macdar/Resources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0.0;
+				MARKETING_VERSION = 0.1.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				OTHER_LDFLAGS = (
 					"-lz",
 					"-lbz2",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.fahrenheitresearch.macdar;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.fahrenheitresearch.level2radar;
+				PRODUCT_NAME = "Level2 Radar";
 				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OBJC_BRIDGING_HEADER = "macdar/Bridge/macdar-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 5.9;
-				TARGETED_DEVICE_FAMILY = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
 		};
@@ -395,7 +398,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = X65S282G57;
 				INFOPLIST_FILE = macdar/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -411,7 +413,6 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = X65S282G57;
 				INFOPLIST_FILE = macdar/Resources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -459,6 +460,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = NO;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -484,7 +486,7 @@
 				);
 				INFOPLIST_FILE = macdar/Resources/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 1.0.0;
+				MARKETING_VERSION = 0.1.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -492,14 +494,15 @@
 					"-lz",
 					"-lbz2",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.fahrenheitresearch.macdar;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.fahrenheitresearch.level2radar;
+				PRODUCT_NAME = "Level2 Radar";
 				SDKROOT = iphoneos;
+				SUPPORTS_MACCATALYST = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OBJC_BRIDGING_HEADER = "macdar/Bridge/macdar-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.9;
-				TARGETED_DEVICE_FAMILY = 1;
+				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
 		};

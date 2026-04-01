@@ -190,10 +190,12 @@ public:
     void            toggleLiveLoopPlayback();
     int             liveLoopLength() const { return m_liveLoopLength; }
     void            setLiveLoopLength(int frames);
+    int             liveLoopTargetFrames() const { return m_liveLoopLength; }
     int             liveLoopMaxFrames() const { return MAX_LIVE_LOOP_FRAMES; }
     int             liveLoopAvailableFrames() const { return m_liveLoopCount; }
     int             liveLoopPlaybackFrame() const { return m_liveLoopPlaybackIndex; }
     void            setLiveLoopPlaybackFrame(int index);
+    void            goToLiveLoopLatestFrame();
     float           liveLoopSpeed() const { return m_liveLoopSpeed; }
     void            setLiveLoopSpeed(float fps);
     bool            liveLoopViewingHistory() const;
@@ -422,7 +424,7 @@ public:
     }
 
     // Rolling live loop cache
-    static constexpr int MAX_LIVE_LOOP_FRAMES = 12;
+    static constexpr int MAX_LIVE_LOOP_FRAMES = 16;
     bool m_liveLoopEnabled = true;
     bool m_liveLoopPlaying = false;
     int m_liveLoopLength = 8;

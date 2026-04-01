@@ -19,7 +19,7 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
     private var engineInitialized = false
     private var fullDrawableSize: CGSize = .zero
     private var currentRenderScale: CGFloat = 1.0
-    private let interactionRenderScale: CGFloat = 0.65
+    private var interactionActive = false
     private let restoreDelaySeconds: TimeInterval = 0.22
     private var restoreWorkItem: DispatchWorkItem?
 
@@ -190,10 +190,11 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
     }
 
     func setInteractionActive(_ active: Bool) {
+        interactionActive = active
         restoreWorkItem?.cancel()
 
         if active {
-            applyRenderScale(interactionRenderScale)
+            applyRenderScale(preferredInteractionRenderScale())
             return
         }
 
@@ -202,6 +203,22 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
         }
         restoreWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelaySeconds, execute: workItem)
+    }
+
+    func refreshInteractionPolicy() {
+        guard interactionActive else { return }
+        applyRenderScale(preferredInteractionRenderScale())
+    }
+
+    private func preferredInteractionRenderScale() -> CGFloat {
+        if appState?.prefersFullResolutionInteraction == true {
+            return 1.0
+        }
+#if targetEnvironment(macCatalyst)
+        return 0.82
+#else
+        return 0.65
+#endif
     }
 
     private func applyRenderScale(_ scale: CGFloat) {

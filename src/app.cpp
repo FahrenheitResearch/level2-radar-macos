@@ -2305,6 +2305,12 @@ void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::strin
     m_liveLoopFrameWidth = w;
     m_liveLoopFrameHeight = h;
 
+    const bool bufferWasFull = m_liveLoopCount >= m_liveLoopLength;
+    const bool preservePlaybackIndex =
+        m_liveLoopCount > 0 &&
+        (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1));
+    const int preservedPlaybackIndex = m_liveLoopPlaybackIndex;
+
     const int slot = m_liveLoopWriteIndex;
     const size_t sz = (size_t)w * h * sizeof(uint32_t);
     if (!m_liveLoopFrames[slot])
@@ -2317,7 +2323,14 @@ void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::strin
         m_liveLoopCount++;
 
     m_liveLoopWriteIndex = (m_liveLoopWriteIndex + 1) % MAX_LIVE_LOOP_FRAMES;
-    m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    if (preservePlaybackIndex) {
+        int nextPlaybackIndex = preservedPlaybackIndex;
+        if (bufferWasFull)
+            nextPlaybackIndex = std::max(0, nextPlaybackIndex - 1);
+        m_liveLoopPlaybackIndex = std::max(0, std::min(nextPlaybackIndex, m_liveLoopCount - 1));
+    } else {
+        m_liveLoopPlaybackIndex = std::max(0, m_liveLoopCount - 1);
+    }
     m_liveLoopCapturePending = false;
     m_needsRerender = true;
 }
@@ -2496,6 +2509,18 @@ void App::setLiveLoopPlaybackFrame(int index) {
     }
 
     m_liveLoopPlaybackIndex = std::max(0, std::min(index, m_liveLoopCount - 1));
+    m_liveLoopPlaying = false;
+    m_liveLoopAccumulator = 0.0f;
+    m_needsRerender = true;
+    m_needsComposite = true;
+}
+
+void App::goToLiveLoopLatestFrame() {
+    if (m_liveLoopCount <= 0) {
+        m_liveLoopPlaybackIndex = 0;
+    } else {
+        m_liveLoopPlaybackIndex = m_liveLoopCount - 1;
+    }
     m_liveLoopPlaying = false;
     m_liveLoopAccumulator = 0.0f;
     m_needsRerender = true;

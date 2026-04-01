@@ -1,6 +1,6 @@
 # Level2 Radar for macOS
 
-GPU-accelerated NEXRAD weather radar for macOS and iPhone. Metal compute pipeline with live Level II data from AWS.
+Mac Catalyst build of the iPhone-first Level II radar app. SwiftUI shell, Metal rendering path, live NEXRAD Level II data, and the same app surface as the iOS build running on macOS.
 
 ![macOS](https://img.shields.io/badge/macOS-14%2B-blue) ![iOS](https://img.shields.io/badge/iOS-17%2B-blue) ![Metal](https://img.shields.io/badge/GPU-Metal-orange)
 
@@ -34,11 +34,18 @@ Downloads, installs to `/Applications`, and launches. That's it.
 ```bash
 git clone https://github.com/FahrenheitResearch/level2-radar-macos.git
 cd level2-radar-macos
-./build.sh
-./build/macdar
+./package.sh
 ```
 
-Requires macOS 14+, Xcode CLT (`xcode-select --install`), CMake (`brew install cmake`). Dependencies fetched automatically.
+This generates:
+- `Level2 Radar.app`
+- `level2-radar-macos.zip`
+- `level2-radar-macos.dmg`
+
+Requires:
+- macOS 14+
+- Xcode 15+
+- XcodeGen (`brew install xcodegen`)
 
 ## iOS
 
@@ -49,34 +56,13 @@ Requires:
 - iOS 17+ device
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) if regenerating the project
 
-## Controls (macOS)
+## macOS Release Shape
 
-| Key | Action |
-|-----|--------|
-| `1-7` | Select radar product |
-| `Left/Right` | Cycle products |
-| `Up/Down` | Cycle tilts |
-| `A` | Toggle national mosaic |
-| `V` | Toggle 3D volume |
-| `X` | Toggle cross-section |
-| `S` | Storm-relative velocity |
-| `R` | Refresh live data |
-| Scroll | Pan |
-| Pinch | Zoom |
-| Click | Select nearest station |
-
-## Architecture
-
-13 Metal compute kernels ported from CUDA:
-- Forward rasterization with 32-bit atomic depth compositing
-- Spatial grid acceleration for mosaic rendering
-- 3D volume building, smoothing, and ray marching
-- GPU-accelerated Level 2 parsing pipeline
-- Hardware-interpolated 1D color lookup textures
-
-## Origin
-
-Metal port of [cursdar2](https://github.com/FahrenheitResearch/cursdar2). Same rendering pipeline, runs on Apple Silicon instead of NVIDIA.
+This repo ships the iOS app on macOS via Mac Catalyst:
+- SwiftUI app shell from `ios/macdar`
+- same Metal-backed radar view used on iPhone
+- same station picker, diagnostics, and core radar UX
+- not the older standalone desktop `macdar` app
 
 ## License
 
