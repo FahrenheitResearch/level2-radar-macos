@@ -25,9 +25,9 @@ Paste this in Terminal:
 curl -sL https://raw.githubusercontent.com/FahrenheitResearch/level2-radar-macos/main/install.sh | bash
 ```
 
-Downloads, installs to `/Applications`, and launches. That's it.
+Downloads the latest DMG, installs to `/Applications`, and launches. That's it.
 
-> Or grab `level2-radar-macos.zip` or `level2-radar-macos.dmg` manually from [Releases](https://github.com/FahrenheitResearch/level2-radar-macos/releases). If macOS says the app is from an unidentified developer, remove quarantine with `xattr -cr "/Applications/Level2 Radar.app"` after install.
+> Or grab `level2-radar-macos.dmg` manually from [Releases](https://github.com/FahrenheitResearch/level2-radar-macos/releases). Official GitHub release DMGs are intended to be Developer ID signed, notarized, and stapled.
 
 ## Build from Source (macOS)
 
@@ -63,6 +63,33 @@ This repo ships the iOS app on macOS via Mac Catalyst:
 - same Metal-backed radar view used on iPhone
 - same station picker, diagnostics, and core radar UX
 - not the older standalone desktop `macdar` app
+
+## GitHub Release Signing
+
+This repo is set up for GitHub-hosted macOS releases that are Apple-signed and notarized. Add these GitHub Actions repository secrets:
+
+- `MACOS_DEVELOPER_ID_P12_BASE64`: base64-encoded `.p12` export of your `Developer ID Application` certificate
+- `MACOS_DEVELOPER_ID_P12_PASSWORD`: password used when exporting that `.p12`
+- `APPLE_ID`: your Apple ID email
+- `APPLE_APP_SPECIFIC_PASSWORD`: app-specific password for notarization
+
+The workflow already uses Team ID `X65S282G57`.
+
+After the secrets are set, create and push a release tag:
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+GitHub Actions will:
+- build the Mac Catalyst app
+- sign it with Developer ID
+- notarize the DMG with Apple
+- staple the notarization ticket
+- publish the DMG on the GitHub release for that tag
+
+Source builds on your own machine are not notarized unless you run the same Apple signing/notarization steps locally.
 
 ## License
 

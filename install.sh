@@ -1,23 +1,23 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 APP_NAME="Level2 Radar.app"
-ZIP_NAME="level2-radar-macos.zip"
+DMG_NAME="level2-radar-macos.dmg"
 REPO="FahrenheitResearch/level2-radar-macos"
 
 echo "Installing Level2 Radar..."
 
-# Download latest release
+# Download latest release DMG
 TMPDIR=$(mktemp -d)
-ZIP="$TMPDIR/$ZIP_NAME"
-curl -sL "https://github.com/$REPO/releases/latest/download/$ZIP_NAME" -o "$ZIP"
+DMG="$TMPDIR/$DMG_NAME"
+curl -sL "https://github.com/$REPO/releases/latest/download/$DMG_NAME" -o "$DMG"
 
-# Unzip
-cd "$TMPDIR"
-unzip -q "$ZIP"
-
-# Remove quarantine flag (prevents Gatekeeper "damaged" error)
-xattr -cr "$APP_NAME"
+# Mount DMG and copy app out
+MOUNT_POINT="$TMPDIR/mount"
+mkdir -p "$MOUNT_POINT"
+hdiutil attach "$DMG" -mountpoint "$MOUNT_POINT" -nobrowse -quiet
+cp -R "$MOUNT_POINT/$APP_NAME" "$TMPDIR/$APP_NAME"
+hdiutil detach "$MOUNT_POINT" -quiet
 
 # Move to Applications
 if [ -d "/Applications/$APP_NAME" ]; then

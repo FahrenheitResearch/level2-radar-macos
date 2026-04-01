@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 VERSION="${VERSION:-0.1.0}"
+BUILD_NUMBER="${BUILD_NUMBER:-1}"
 APP_NAME="Level2 Radar"
 APP_BUNDLE="${APP_NAME}.app"
 ZIP_NAME="level2-radar-macos.zip"
@@ -23,7 +24,9 @@ xcodebuild \
   -derivedDataPath "$DERIVED_DATA_PATH" \
   -destination 'generic/platform=macOS,variant=Mac Catalyst' \
   build \
-  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_ALLOWED=NO \
+  MARKETING_VERSION="$VERSION" \
+  CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 cd ..
 
 cp -R "$PRODUCT_PATH" "$APP_BUNDLE"
@@ -47,6 +50,7 @@ hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_STAGING" -ov -format
 rm -rf "$DMG_STAGING"
 
 echo ""
+echo "Version: $VERSION ($BUILD_NUMBER)"
 echo "Packaged: $APP_BUNDLE"
 echo "Distribution ZIP: $ZIP_NAME ($(du -h "$ZIP_NAME" | cut -f1))"
 echo "Distribution DMG: $DMG_NAME ($(du -h "$DMG_NAME" | cut -f1))"
