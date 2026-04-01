@@ -6,6 +6,39 @@ extension Notification.Name {
     static let radarStationChanged = Notification.Name("radarStationChanged")
 }
 
+final class RadarInteractionContainerView: UIView {
+    var onEscape: (() -> Void)?
+
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+
+    override var keyCommands: [UIKeyCommand]? {
+#if targetEnvironment(macCatalyst)
+        let command = UIKeyCommand(
+            input: UIKeyCommand.inputEscape,
+            modifierFlags: [],
+            action: #selector(handleEscapeKey)
+        )
+        command.discoverabilityTitle = "Unlock station tracking"
+        return [command]
+#else
+        return super.keyCommands
+#endif
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.becomeFirstResponder()
+        }
+    }
+
+    @objc private func handleEscapeKey() {
+        onEscape?()
+    }
+}
+
 final class StationOverlayView: UIView {
     private var stations: [RadarStationInfo] = []
     private var activeStationIndex: Int = -1
@@ -108,8 +141,11 @@ struct RadarMapView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UIView {
-        let container = UIView()
+        let container = RadarInteractionContainerView()
         container.backgroundColor = UIColor(red: 0.035, green: 0.047, blue: 0.074, alpha: 1.0)
+        container.onEscape = { [weak coordinator = context.coordinator] in
+            coordinator?.handleEscapeKey()
+        }
 
         let mtkView = MTKView()
         mtkView.device = appState.device
@@ -178,6 +214,7 @@ struct RadarMapView: UIViewRepresentable {
         weak var mtkView: MTKView?
         weak var overlayView: StationOverlayView?
         var renderCoordinator: MetalRenderCoordinator?
+        private var lastHoverLocation: CGPoint?
 
         init(appState: AppState) {
             self.appState = appState
@@ -208,6 +245,12 @@ struct RadarMapView: UIViewRepresentable {
             view.addGestureRecognizer(pan)
             view.addGestureRecognizer(pinch)
             view.addGestureRecognizer(tap)
+
+#if targetEnvironment(macCatalyst)
+            let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
+            hover.delegate = self
+            view.addGestureRecognizer(hover)
+#endif
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
@@ -222,6 +265,20 @@ struct RadarMapView: UIViewRepresentable {
 
         private func engineInputScale() -> CGFloat {
             pixelScale() * (renderCoordinator?.inputScale ?? 1.0)
+        }
+
+        private var isMacCatalystShell: Bool {
+#if targetEnvironment(macCatalyst)
+            true
+#else
+            false
+#endif
+        }
+
+        private func syncAfterStationMutation() {
+            appState.syncFromEngine()
+            syncOverlayFromAppState()
+            renderCoordinator?.requestDraw()
         }
 
         func syncOverlayFromAppState() {
@@ -280,10 +337,50 @@ struct RadarMapView: UIViewRepresentable {
             let location = recognizer.location(in: view)
             let scale = engineInputScale()
 
+            if isMacCatalystShell,
+               appState.archiveStatus?.active != true {
+                appState.engine.hover(atScreenX: Double(location.x * scale), y: Double(location.y * scale))
+                lastHoverLocation = location
+                appState.lockCurrentTrackedStation()
+                syncOverlayFromAppState()
+                renderCoordinator?.requestDraw()
+                return
+            }
+
             appState.engine.tap(atScreenX: Double(location.x * scale), y: Double(location.y * scale))
-            appState.syncFromEngine()
-            syncOverlayFromAppState()
-            renderCoordinator?.requestDraw()
+            syncAfterStationMutation()
+        }
+
+#if targetEnvironment(macCatalyst)
+        @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+            guard let view = containerView,
+                  appState.archiveStatus?.active != true else { return }
+
+            let location = recognizer.location(in: view)
+            lastHoverLocation = location
+
+            let activeBefore = appState.activeStationIndex
+            let scale = engineInputScale()
+            appState.engine.hover(atScreenX: Double(location.x * scale), y: Double(location.y * scale))
+
+            let activeAfter = Int(appState.engine.activeStationIndex)
+            if activeAfter != activeBefore {
+                syncAfterStationMutation()
+            }
+        }
+#endif
+
+        func handleEscapeKey() {
+            guard isMacCatalystShell,
+                  appState.stationTrackingLocked,
+                  appState.archiveStatus?.active != true else { return }
+
+            appState.engine.unlockStationAutoTrack()
+            if let location = lastHoverLocation {
+                let scale = engineInputScale()
+                appState.engine.hover(atScreenX: Double(location.x * scale), y: Double(location.y * scale))
+            }
+            syncAfterStationMutation()
         }
 
         private func updateInteractionState(for recognizer: UIGestureRecognizer) {

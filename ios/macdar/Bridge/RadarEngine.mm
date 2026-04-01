@@ -157,6 +157,13 @@
     }
 }
 
+- (void)hoverAtScreenX:(double)x y:(double)y {
+    @synchronized (self) {
+        if (!_initialized) return;
+        _app->onMouseMove(x, y);
+    }
+}
+
 - (void)tapAtScreenX:(double)x y:(double)y {
     @synchronized (self) {
         if (!_initialized) return;
@@ -335,10 +342,33 @@
     }
 }
 
+- (BOOL)stationAutoTrackEnabled {
+    @synchronized (self) {
+        if (!_initialized) return YES;
+        return _app->autoTrackStation() ? YES : NO;
+    }
+}
+
 - (void)selectStation:(int)idx centerView:(BOOL)center {
     @synchronized (self) {
         if (!_initialized) return;
         _app->selectStation(idx, (bool)center);
+    }
+}
+
+- (void)lockActiveStation {
+    @synchronized (self) {
+        if (!_initialized) return;
+        const int idx = _app->activeStation();
+        if (idx < 0) return;
+        _app->selectStation(idx, false);
+    }
+}
+
+- (void)unlockStationAutoTrack {
+    @synchronized (self) {
+        if (!_initialized) return;
+        _app->setAutoTrackStation(true);
     }
 }
 
@@ -848,6 +878,27 @@
     @synchronized (self) {
         if (!_initialized) return;
         _app->loadHistoricEvent(idx);
+    }
+}
+
+- (BOOL)loadArchiveRangeForStation:(NSString *)station
+                              year:(int)year
+                             month:(int)month
+                               day:(int)day
+                         startHour:(int)startHour
+                       startMinute:(int)startMinute
+                           endHour:(int)endHour
+                         endMinute:(int)endMinute {
+    @synchronized (self) {
+        if (!_initialized) return NO;
+        std::string stationCode = station ? std::string(station.UTF8String) : std::string();
+        const bool loaded = _app->loadArchiveRange(stationCode, year, month, day,
+                                                   startHour, startMinute,
+                                                   endHour, endMinute);
+        if (loaded) {
+            _app->rerenderAll();
+        }
+        return loaded ? YES : NO;
     }
 }
 

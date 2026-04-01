@@ -179,8 +179,26 @@ struct ContentView: View {
         HStack(spacing: 8) {
             inlineBadge(label: "QUAL", value: appState.orchestrator.renderQuality.rawValue)
             inlineBadge(label: "SWEEPS", value: "\(appState.activeStationSweepCount)")
+            if isMacCatalystShell && appState.archiveStatus?.active != true {
+                inlineBadge(label: "MODE", value: appState.stationTrackingLocked ? "LOCKED" : "FOLLOW")
+                if appState.stationTrackingLocked {
+                    inlineBadge(label: "ESC", value: "UNLOCK")
+                }
+            }
 
             Spacer(minLength: 0)
+
+            if appState.activeProduct == 1 || appState.engine.srvMode {
+                chromeTextButton(title: appState.engine.srvMode ? "SRV ON" : "SRV") {
+                    appState.setSRVMode(!appState.engine.srvMode)
+                }
+            }
+
+            if isMacCatalystShell && appState.stationTrackingLocked && appState.archiveStatus?.active != true {
+                chromeTextButton(title: "UNLOCK") {
+                    appState.unlockStationTracking()
+                }
+            }
 
             chromeTextButton(title: "ARCHIVE") {
                 showLoop = true

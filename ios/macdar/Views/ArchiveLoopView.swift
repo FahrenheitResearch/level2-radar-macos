@@ -3,9 +3,30 @@ import SwiftUI
 struct ArchiveLoopView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) var dismiss
+    @State private var archiveStationICAO: String = ""
+    @State private var archiveDate = Date()
+    @State private var archiveStartTime = Date().addingTimeInterval(-3600)
+    @State private var archiveEndTime = Date()
+    @State private var archiveLoadError = ""
 
     private var archive: RadarArchiveStatus? {
         appState.archiveStatus
+    }
+
+    private var utcTimeZone: TimeZone {
+        TimeZone(secondsFromGMT: 0)!
+    }
+
+    private var quickStationChoices: [RadarStationInfo] {
+        var seen = Set<String>()
+        let seed = [appState.activeStationInfo].compactMap { $0 } +
+            appState.favoriteStations +
+            appState.recentStations
+        return seed.filter { station in
+            guard !seen.contains(station.icao) else { return false }
+            seen.insert(station.icao)
+            return true
+        }
     }
 
     var body: some View {
@@ -22,6 +43,7 @@ struct ArchiveLoopView: View {
                         introCard
                     }
 
+                    customArchiveSection
                     presetSection
                 }
                 .padding(.horizontal, 16)
@@ -30,6 +52,7 @@ struct ArchiveLoopView: View {
             }
         }
         .onAppear {
+            seedArchiveFormIfNeeded()
             appState.syncFromEngine()
         }
     }
@@ -69,11 +92,116 @@ struct ArchiveLoopView: View {
     private var introCard: some View {
         sectionCard(
             title: "START A LOOP",
-            subtitle: "Load one of the built-in archive events to scrub, play, and inspect radar frames."
+            subtitle: "Load a custom UTC range or use one of the built-in archive events to scrub, play, and inspect radar frames."
         ) {
             Text("Archive playback keeps the same radar shell active while the engine downloads and decodes a preset Level II range in the background.")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.white.opacity(0.72))
+        }
+    }
+
+    private var customArchiveSection: some View {
+        sectionCard(
+            title: "CUSTOM RANGE",
+            subtitle: "Pull any NEXRAD site's archive by ICAO and UTC time window."
+        ) {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .center, spacing: 10) {
+                        TextField("KTLX", text: $archiveStationICAO)
+                            .textInputAutocapitalization(.characters)
+                            .autocorrectionDisabled()
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(Color.black.opacity(0.22))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .stroke(radarChromePanelEdge.opacity(0.74), lineWidth: 1)
+                                    )
+                            )
+                            .onChange(of: archiveStationICAO) { _, newValue in
+                                archiveStationICAO = String(newValue.uppercased().prefix(4))
+                            }
+
+                        if !quickStationChoices.isEmpty {
+                            Menu("QUICK SITE") {
+                                ForEach(quickStationChoices, id: \.icao) { station in
+                                    Button("\(station.icao)  \(station.siteName)") {
+                                        archiveStationICAO = station.icao
+                                    }
+                                }
+                            }
+                            .font(.system(size: 11, weight: .black, design: .monospaced))
+                            .tracking(1.0)
+                            .foregroundColor(.white)
+                        }
+                    }
+
+                    Text("Enter a 4-letter radar ICAO or use the current/favorite sites.")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("DATE")
+                        .font(.system(size: 10, weight: .black, design: .monospaced))
+                        .tracking(1.0)
+                        .foregroundColor(.white.opacity(0.56))
+
+                    DatePicker("UTC Date",
+                               selection: $archiveDate,
+                               displayedComponents: .date)
+                        .labelsHidden()
+                        .environment(\.timeZone, utcTimeZone)
+                }
+
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("START (UTC)")
+                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .tracking(1.0)
+                            .foregroundColor(.white.opacity(0.56))
+
+                        DatePicker("Start UTC",
+                                   selection: $archiveStartTime,
+                                   displayedComponents: .hourAndMinute)
+                            .labelsHidden()
+                            .environment(\.timeZone, utcTimeZone)
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("END (UTC)")
+                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .tracking(1.0)
+                            .foregroundColor(.white.opacity(0.56))
+
+                        DatePicker("End UTC",
+                                   selection: $archiveEndTime,
+                                   displayedComponents: .hourAndMinute)
+                            .labelsHidden()
+                            .environment(\.timeZone, utcTimeZone)
+                    }
+                }
+
+                Text("If the end time is earlier than the start time, the loop continues past midnight UTC.")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white.opacity(0.58))
+
+                if !archiveLoadError.isEmpty {
+                    Text(archiveLoadError)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Color(red: 1.0, green: 0.55, blue: 0.46))
+                }
+
+                actionButton(title: archive?.loading == true ? "DOWNLOADING" : "LOAD RANGE") {
+                    loadCustomArchive()
+                }
+                .disabled(archive?.loading == true || archiveStationICAO.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
 
@@ -323,5 +451,27 @@ struct ArchiveLoopView: View {
         String(format: "%02d:%02d-%02d:%02d UTC",
                event.startHour, event.startMinute,
                event.endHour, event.endMinute)
+    }
+
+    private func seedArchiveFormIfNeeded() {
+        if archiveStationICAO.isEmpty {
+            archiveStationICAO = appState.activeStationInfo?.icao ?? "KTLX"
+        }
+    }
+
+    private func loadCustomArchive() {
+        archiveLoadError = ""
+        seedArchiveFormIfNeeded()
+
+        let loaded = appState.loadArchiveRange(
+            stationICAO: archiveStationICAO,
+            archiveDate: archiveDate,
+            startTime: archiveStartTime,
+            endTime: archiveEndTime
+        )
+
+        if !loaded {
+            archiveLoadError = "Could not start that archive request. Check the ICAO and UTC time range."
+        }
     }
 }

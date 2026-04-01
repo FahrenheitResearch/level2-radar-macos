@@ -72,6 +72,7 @@ class AppState: ObservableObject {
     @Published var activeStationDetail: String = "Radar site"
     @Published var activeStationScanTime: String = "Waiting for data"
     @Published var activeStationIndex: Int = -1
+    @Published var stationAutoTrackEnabled: Bool = true
     @Published var productName: String = "REF"
     @Published var mosaicMode: Bool = false
     @Published var isRendering: Bool = true
@@ -163,6 +164,10 @@ class AppState: ObservableObject {
 #endif
     }
 
+    var stationTrackingLocked: Bool {
+        !stationAutoTrackEnabled
+    }
+
     func initialize(width: Int, height: Int) {
         engine.initialize(with: device, width: Int32(width), height: Int32(height))
         applyPersistedRuntimeSettings()
@@ -186,6 +191,7 @@ class AppState: ObservableObject {
         tiltAngle = engine.activeTiltAngle
         stationsLoaded = Int(engine.stationsLoaded)
         activeStationIndex = Int(engine.activeStationIndex)
+        stationAutoTrackEnabled = engine.stationAutoTrackEnabled
         productName = productNames[min(max(Int(engine.activeProduct), 0), productNames.count - 1)]
         mosaicMode = engine.mosaicMode
         centerLat = engine.centerLat
@@ -450,6 +456,59 @@ class AppState: ObservableObject {
         defaults.set(station.icao, forKey: AppPreferenceKey.lastStationICAO)
         pushRecentStation(station.icao)
         engine.selectStation(station.index, centerView: centerView)
+        syncFromEngine()
+        NotificationCenter.default.post(name: .radarStationChanged, object: nil)
+    }
+
+    @discardableResult
+    func loadArchiveRange(stationICAO: String,
+                          archiveDate: Date,
+                          startTime: Date,
+                          endTime: Date) -> Bool {
+        let trimmedStation = stationICAO
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        guard !trimmedStation.isEmpty else { return false }
+
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+
+        let day = utcCalendar.dateComponents([.year, .month, .day], from: archiveDate)
+        let start = utcCalendar.dateComponents([.hour, .minute], from: startTime)
+        let end = utcCalendar.dateComponents([.hour, .minute], from: endTime)
+
+        guard let year = day.year,
+              let month = day.month,
+              let dayOfMonth = day.day,
+              let startHour = start.hour,
+              let startMinute = start.minute,
+              let endHour = end.hour,
+              let endMinute = end.minute else {
+            return false
+        }
+
+        let loaded = engine.loadArchiveRange(forStation: trimmedStation,
+                                             year: Int32(year),
+                                             month: Int32(month),
+                                             day: Int32(dayOfMonth),
+                                             startHour: Int32(startHour),
+                                             startMinute: Int32(startMinute),
+                                             endHour: Int32(endHour),
+                                             endMinute: Int32(endMinute))
+        if loaded {
+            syncFromEngine()
+        }
+        return loaded
+    }
+
+    func lockCurrentTrackedStation() {
+        engine.lockActiveStation()
+        syncFromEngine()
+        NotificationCenter.default.post(name: .radarStationChanged, object: nil)
+    }
+
+    func unlockStationTracking() {
+        engine.unlockStationAutoTrack()
         syncFromEngine()
         NotificationCenter.default.post(name: .radarStationChanged, object: nil)
     }

@@ -89,6 +89,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)zoomAtLat:(double)lat lon:(double)lon magnification:(double)mag;
 - (void)zoomAtScreenX:(double)x y:(double)y magnification:(double)mag;
 - (void)zoomByMagnification:(double)mag;
+- (void)hoverAtScreenX:(double)x y:(double)y;
 - (void)tapAtScreenX:(double)x y:(double)y;
 - (void)resizeWidth:(int)w height:(int)h;
 
@@ -114,7 +115,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) int stationsTotal;
 @property (nonatomic, readonly) int stationsDownloading;
 @property (nonatomic, readonly) int warningCount;
+@property (nonatomic, readonly) BOOL stationAutoTrackEnabled;
 - (void)selectStation:(int)idx centerView:(BOOL)center;
+- (void)lockActiveStation;
+- (void)unlockStationAutoTrack;
 - (NSArray<RadarStationInfo *> *)stationList;
 
 // Multi-radar mode
@@ -152,6 +156,14 @@ NS_ASSUME_NONNULL_BEGIN
 - (RadarArchiveStatus *)archiveStatus;
 - (RadarLiveLoopStatus *)liveLoopStatus;
 - (void)loadHistoricEvent:(int)idx;
+- (BOOL)loadArchiveRangeForStation:(NSString *)station
+                              year:(int)year
+                             month:(int)month
+                               day:(int)day
+                         startHour:(int)startHour
+                       startMinute:(int)startMinute
+                           endHour:(int)endHour
+                         endMinute:(int)endMinute;
 - (void)toggleArchivePlayback;
 - (void)toggleLiveLoopPlayback;
 - (void)setLiveLoopFrame:(int)frame;
