@@ -98,8 +98,10 @@ jobs:
 
           Includes:
           - SwiftUI + Metal Mac build of the iOS radar app
-          - live-site playback with backfilled live loops
-          - loop scrubber with a LIVE jump button on macOS
+          - lower-latency live-site playback with backfilled live loops
+          - direct-present loop playback path to cut host-side copy overhead
+          - preview-first archive loading so a usable frame appears sooner
+          - live loop scrubber with a LIVE jump button on macOS
           - adjustable loop depth and optional full-resolution interaction rendering
 
           Release notes:

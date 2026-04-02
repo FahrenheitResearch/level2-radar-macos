@@ -120,7 +120,8 @@ public:
     bool init(int windowWidth, int windowHeight);
 #ifdef __OBJC__
     bool init(int windowWidth, int windowHeight, id<MTLDevice> device);
-    id<MTLBuffer> getOutputBuffer() const { return m_d_compositeOutput; }
+    id<MTLBuffer> getOutputBuffer() const { return m_currentDisplayBuffer ? m_currentDisplayBuffer : m_d_compositeOutput; }
+    id<MTLBuffer> getOverlayBuffer() const { return m_singleStationMode ? m_d_boundaryOverlay : nil; }
 #endif
 
     // Main update loop (called each frame)
@@ -265,6 +266,9 @@ private:
     void requestLiveLoopCapture();
     void updateLiveLoop(float dt);
     void captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::string& label);
+    id<MTLBuffer> ensureCachedFrameBuffer(int frameIdx, size_t size);
+    int reserveLiveLoopFrameSlot(int w, int h);
+    void publishLiveLoopFrameSlot(int slot, const std::string& label);
     int liveLoopSlotForIndex(int index) const;
     std::string currentLiveLoopCaptureLabel() const;
     void requestLiveLoopBackfill();
@@ -298,6 +302,8 @@ private:
 
     // GPU compositor output
     id<MTLBuffer>   m_d_compositeOutput = nil;
+    id<MTLBuffer>   m_currentDisplayBuffer = nil;
+    id<MTLBuffer>   m_d_boundaryOverlay = nil;
     MetalTexture   m_outputTex;
 
     // Spatial grid for fast station lookup in compositor
@@ -347,6 +353,7 @@ private:
     int  m_boundaryCacheW = 0, m_boundaryCacheH = 0;
     double m_boundaryCacheCLat = 0, m_boundaryCacheCLon = 0, m_boundaryCacheZoom = 0;
     uint64_t m_boundaryCacheWarningSignature = 0;
+    bool m_boundaryOverlayDirty = true;
     void rasterizeBoundaries();
 
     // Auto-refresh timer

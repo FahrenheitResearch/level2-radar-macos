@@ -40,6 +40,17 @@ struct ForwardRenderParams {
     float srv_dir_rad;
 };
 
+struct BufferBlitVertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+struct BufferBlitParams {
+    uint width;
+    uint height;
+    uint hasOverlay;
+};
+
 // ── Helper functions ───────────────────────────────────────────
 
 inline uint makeRGBA(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
@@ -99,6 +110,69 @@ inline float normalizedColorCoord(float value, int product) {
     float norm = (value - min_val) / (max_val - min_val);
     norm = min(max(norm, 0.0f), 1.0f);
     return (norm * 254.0f + 1.0f) / 256.0f;
+}
+
+inline float4 unpackRgba(uchar4 rgba) {
+    return float4(rgba) / 255.0f;
+}
+
+inline float4 samplePackedBuffer(const device uchar4* pixels,
+                                 constant BufferBlitParams& params,
+                                 float2 uv) {
+    if (params.width == 0 || params.height == 0)
+        return float4(0.0f);
+
+    const float2 clampedUv = clamp(uv, float2(0.0f), float2(1.0f));
+    const float2 maxCoord = float2(max(int(params.width) - 1, 0),
+                                   max(int(params.height) - 1, 0));
+    const float2 src = clampedUv * maxCoord;
+
+    const uint x0 = min((uint)floor(src.x), params.width - 1);
+    const uint y0 = min((uint)floor(src.y), params.height - 1);
+    const uint x1 = min(x0 + 1, params.width - 1);
+    const uint y1 = min(y0 + 1, params.height - 1);
+
+    const float tx = src.x - floor(src.x);
+    const float ty = src.y - floor(src.y);
+
+    const float4 c00 = unpackRgba(pixels[y0 * params.width + x0]);
+    const float4 c10 = unpackRgba(pixels[y0 * params.width + x1]);
+    const float4 c01 = unpackRgba(pixels[y1 * params.width + x0]);
+    const float4 c11 = unpackRgba(pixels[y1 * params.width + x1]);
+
+    const float4 top = mix(c00, c10, tx);
+    const float4 bottom = mix(c01, c11, tx);
+    return mix(top, bottom, ty);
+}
+
+vertex BufferBlitVertexOut blit_buffer_vertex(uint vid [[vertex_id]]) {
+    float2 positions[3] = {
+        float2(-1.0f, -1.0f),
+        float2( 3.0f, -1.0f),
+        float2(-1.0f,  3.0f)
+    };
+    float2 texCoords[3] = {
+        float2(0.0f,  1.0f),
+        float2(2.0f,  1.0f),
+        float2(0.0f, -1.0f)
+    };
+
+    BufferBlitVertexOut out;
+    out.position = float4(positions[vid], 0.0f, 1.0f);
+    out.texCoord = texCoords[vid];
+    return out;
+}
+
+fragment float4 blit_buffer_fragment(BufferBlitVertexOut in [[stage_in]],
+                                     const device uchar4* pixels [[buffer(0)]],
+                                     constant BufferBlitParams& params [[buffer(1)]],
+                                     const device uchar4* overlayPixels [[buffer(2)]]) {
+    float4 base = samplePackedBuffer(pixels, params, in.texCoord);
+    if (params.hasOverlay == 0)
+        return base;
+
+    const float4 overlay = samplePackedBuffer(overlayPixels, params, in.texCoord);
+    return mix(base, overlay, overlay.a);
 }
 
 // 32-bit depth key: upper 16 bits = depth (quantized range), lower 16 bits = color index

@@ -81,6 +81,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Output
 - (id<MTLBuffer> _Nullable)outputBuffer;
+- (id<MTLBuffer> _Nullable)overlayBuffer;
 - (int)viewportWidth;
 - (int)viewportHeight;
 

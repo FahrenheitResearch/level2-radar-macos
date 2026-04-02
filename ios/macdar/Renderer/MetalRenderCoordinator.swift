@@ -4,6 +4,12 @@ import UIKit
 
 @MainActor
 class MetalRenderCoordinator: NSObject, MTKViewDelegate {
+    private struct BufferBlitParams {
+        var width: UInt32
+        var height: UInt32
+        var hasOverlay: UInt32
+    }
+
     let engine: RadarEngine
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -12,10 +18,8 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
 
     private weak var view: MTKView?
 
-    // GPU copy + full-screen blit into the MTKView drawable.
+    // Full-screen blit into the MTKView drawable from the engine's output buffer.
     private var pipelineState: MTLRenderPipelineState?
-    private var outputTexture: MTLTexture?
-    private var outputTextureSize: (Int, Int) = (0, 0)
     private var engineInitialized = false
     private var fullDrawableSize: CGSize = .zero
     private var currentRenderScale: CGFloat = 1.0
@@ -73,60 +77,23 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
     }
 
     private func buildPipeline() {
-        let shaderSrc = """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        struct VertexOut {
-            float4 position [[position]];
-            float2 texCoord;
-        };
-
-        vertex VertexOut blit_vertex(uint vid [[vertex_id]]) {
-            float2 positions[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
-            float2 texCoords[3] = {float2(0, 1), float2(2, 1), float2(0, -1)};
-            VertexOut out;
-            out.position = float4(positions[vid], 0, 1);
-            out.texCoord = texCoords[vid];
-            return out;
+        guard let library = device.makeDefaultLibrary(),
+              let vertex = library.makeFunction(name: "blit_buffer_vertex"),
+              let fragment = library.makeFunction(name: "blit_buffer_fragment")
+        else {
+            print("MetalRenderCoordinator: Failed to load blit shaders from default library")
+            return
         }
-
-        fragment float4 blit_fragment(VertexOut in [[stage_in]],
-                                       texture2d<float> tex [[texture(0)]]) {
-            constexpr sampler s(filter::linear, address::clamp_to_edge);
-            return tex.sample(s, in.texCoord);
-        }
-        """
 
         do {
-            let library = try device.makeLibrary(source: shaderSrc, options: nil)
             let descriptor = MTLRenderPipelineDescriptor()
-            descriptor.vertexFunction = library.makeFunction(name: "blit_vertex")
-            descriptor.fragmentFunction = library.makeFunction(name: "blit_fragment")
+            descriptor.vertexFunction = vertex
+            descriptor.fragmentFunction = fragment
             descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
-            descriptor.colorAttachments[0].isBlendingEnabled = true
-            descriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            descriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            descriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            descriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
         } catch {
             print("MetalRenderCoordinator: Failed to build blit pipeline: \(error)")
         }
-    }
-
-    private func ensureOutputTexture(width: Int, height: Int) {
-        if outputTextureSize == (width, height) && outputTexture != nil { return }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        desc.usage = .shaderRead
-        desc.storageMode = .private
-        outputTexture = device.makeTexture(descriptor: desc)
-        outputTextureSize = (width, height)
     }
 
     private func initEngineIfNeeded(width: Int, height: Int) {
@@ -288,45 +255,31 @@ class MetalRenderCoordinator: NSObject, MTKViewDelegate {
 
         engine.render()
 
-        guard let outputBuf = engine.outputBuffer() else { return }
-        ensureOutputTexture(width: w, height: h)
-
-        guard let tex = outputTexture,
+        guard let outputBuf = engine.outputBuffer(),
               let drawable = view.currentDrawable,
               let renderPassDesc = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer(),
-              let pipeline = pipelineState,
-              let blitEncoder = commandBuffer.makeBlitCommandEncoder()
+              let pipeline = pipelineState
         else {
             return
         }
-
-        let bytesPerRow = w * MemoryLayout<UInt32>.stride
-        blitEncoder.copy(
-            from: outputBuf,
-            sourceOffset: 0,
-            sourceBytesPerRow: bytesPerRow,
-            sourceBytesPerImage: bytesPerRow * h,
-            sourceSize: MTLSize(width: w, height: h, depth: 1),
-            to: tex,
-            destinationSlice: 0,
-            destinationLevel: 0,
-            destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-        )
-        blitEncoder.endEncoding()
+        let overlayBuffer = engine.overlayBuffer()
 
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc) else {
             return
         }
 
+        var params = BufferBlitParams(width: UInt32(w), height: UInt32(h), hasOverlay: overlayBuffer == nil ? 0 : 1)
         encoder.setRenderPipelineState(pipeline)
-        encoder.setFragmentTexture(tex, index: 0)
+        encoder.setFragmentBuffer(outputBuf, offset: 0, index: 0)
+        encoder.setFragmentBytes(&params, length: MemoryLayout<BufferBlitParams>.stride, index: 1)
+        if let overlayBuffer {
+            encoder.setFragmentBuffer(overlayBuffer, offset: 0, index: 2)
+        }
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
-
-        appState?.syncFromEngine()
     }
 }

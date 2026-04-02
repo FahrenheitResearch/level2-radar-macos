@@ -330,20 +330,67 @@ bool HistoricLoader::startLoad(const std::string& label,
         }
         printf("Found %d frames to download\n", m_totalFrames.load());
 
-        // Download and parse each frame (parallel with 8 threads)
-        downloader = std::make_shared<Downloader>(8);
+        auto publishFrame = [this, cb](int idx, std::shared_ptr<RadarFrame> frame) {
+            {
+                std::lock_guard<std::mutex> lock(m_framesMutex);
+                if (idx >= 0 && idx < (int)m_frames.size()) {
+                    m_frames[idx] = std::move(frame);
+                }
+            }
+
+            int done = ++m_downloadedFrames;
+            if (cb) cb(done, m_totalFrames.load());
+            printf("\rFrames: %d/%d", done, m_totalFrames.load());
+            fflush(stdout);
+        };
+
+        auto fetchFrameAtIndex = [&](int idx) -> bool {
+            if (idx < 0 || idx >= (int)filtered.size() || m_cancel.load())
+                return false;
+
+            const auto& nf = filtered[idx];
+            auto result = Downloader::httpGet(NEXRAD_HOST, "/" + nf.key);
+            if (!result.success || result.data.empty()) {
+                int done = ++m_downloadedFrames;
+                if (cb) cb(done, m_totalFrames.load());
+                return false;
+            }
+
+            auto parsed = Level2Parser::parse(result.data);
+            if (parsed.sweeps.empty()) {
+                int done = ++m_downloadedFrames;
+                if (cb) cb(done, m_totalFrames.load());
+                return false;
+            }
+
+            publishFrame(idx, buildFrame(parsed, nf.key));
+            return true;
+        };
+
+        // Preview newest frames first so the first visible archive image lands quickly.
+        const int previewCount = std::min(2, m_totalFrames.load());
+        bool previewReady = false;
+        for (int offset = 0; offset < previewCount && !m_cancel.load(); ++offset) {
+            const int idx = m_totalFrames.load() - 1 - offset;
+            if (fetchFrameAtIndex(idx)) {
+                m_currentFrame = idx;
+                previewReady = true;
+            }
+        }
+
+        // Warm the remainder in the background, newest to oldest, one at a time.
+        downloader = std::make_shared<Downloader>(1);
         {
             std::lock_guard<std::mutex> lock(m_workerMutex);
             m_downloader = downloader;
         }
-        for (int i = 0; i < m_totalFrames.load(); i++) {
+        for (int i = m_totalFrames.load() - 1 - previewCount; i >= 0; i--) {
             if (m_cancel.load()) break;
-
-            auto& nf = filtered[i];
-            int idx = i;
+            const auto& nf = filtered[i];
+            const int idx = i;
 
             downloader->queueDownload(nf.key, NEXRAD_HOST, "/" + nf.key,
-                [this, idx, cb](const std::string& id, DownloadResult result) {
+                [this, idx, cb, publishFrame](const std::string& id, DownloadResult result) {
                     if (m_cancel.load()) return;
 
                     if (!result.success || result.data.empty()) {
@@ -360,19 +407,7 @@ bool HistoricLoader::startLoad(const std::string& label,
                         return;
                     }
 
-                    // Extract timestamp from key
-                    auto frame = buildFrame(parsed, id);
-                    {
-                        std::lock_guard<std::mutex> lock(m_framesMutex);
-                        if (idx >= 0 && idx < (int)m_frames.size()) {
-                            m_frames[idx] = std::move(frame);
-                        }
-                    }
-
-                    int done = ++m_downloadedFrames;
-                    if (cb) cb(done, m_totalFrames.load());
-                    printf("\rFrames: %d/%d", done, m_totalFrames.load());
-                    fflush(stdout);
+                    publishFrame(idx, buildFrame(parsed, id));
                 }
             );
         }
@@ -405,6 +440,15 @@ bool HistoricLoader::startLoad(const std::string& label,
         {
             std::lock_guard<std::mutex> lock(m_metaMutex);
             m_lastError.clear();
+        }
+        if (!previewReady) {
+            std::lock_guard<std::mutex> lock(m_framesMutex);
+            for (int i = (int)m_frames.size() - 1; i >= 0; --i) {
+                if (m_frames[i]) {
+                    m_currentFrame = i;
+                    break;
+                }
+            }
         }
         printf("\nHistoric event loaded: %d frames ready\n", m_downloadedFrames.load());
         finish(true);

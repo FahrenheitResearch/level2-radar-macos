@@ -603,6 +603,7 @@ App::~App() {
     invalidateLiveLoop(true);
     invalidateFrameCache(true);
     m_d_xsOutput = nil;
+    m_d_boundaryOverlay = nil;
     m_d_compositeOutput = nil;
     if (m_renderer) {
         m_renderer->freeVolume();
@@ -627,6 +628,9 @@ bool App::init(int windowWidth, int windowHeight) {
     size_t outSize = (size_t)windowWidth * windowHeight * sizeof(uint32_t);
     m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
     memset(m_d_compositeOutput.contents, 0, outSize);
+    m_currentDisplayBuffer = m_d_compositeOutput;
+    m_d_boundaryOverlay = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
+    memset(m_d_boundaryOverlay.contents, 0, outSize);
 
     // Create Metal textures for display
     if (!m_outputTex.init(windowWidth, windowHeight, m_renderer->getDevice())) {
@@ -687,6 +691,9 @@ bool App::init(int windowWidth, int windowHeight, id<MTLDevice> device) {
     size_t outSize = (size_t)windowWidth * windowHeight * sizeof(uint32_t);
     m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
     memset(m_d_compositeOutput.contents, 0, outSize);
+    m_currentDisplayBuffer = m_d_compositeOutput;
+    m_d_boundaryOverlay = [m_renderer->getDevice() newBufferWithLength:outSize options:MTLResourceStorageModeShared];
+    memset(m_d_boundaryOverlay.contents, 0, outSize);
 
     // Create Metal textures for display
     if (!m_outputTex.init(windowWidth, windowHeight, m_renderer->getDevice())) {
@@ -1396,6 +1403,8 @@ void App::invalidateFrameCache(bool freeMemory) {
     m_cachedFrameCount = 0;
     m_cachedFrameWidth = 0;
     m_cachedFrameHeight = 0;
+    if (m_currentDisplayBuffer && m_currentDisplayBuffer != m_d_compositeOutput)
+        m_currentDisplayBuffer = m_d_compositeOutput;
 }
 
 void App::ensureCrossSectionBuffer(int width, int height) {
@@ -1819,12 +1828,26 @@ void App::render() {
             (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1)) &&
             m_liveLoopFrameWidth == gpuVp.width &&
             m_liveLoopFrameHeight == gpuVp.height;
+        const bool directPresentPath = m_singleStationMode;
         bool requiresGpuCompletionBeforeCpuAccess = false;
+        const size_t frameBytes = (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t);
+        id<MTLBuffer> renderTarget = m_d_compositeOutput;
+        id<MTLBuffer> displayBuffer = m_d_compositeOutput;
+        int liveCaptureSlot = -1;
+
+        if (capturePending && directPresentPath) {
+            liveCaptureSlot = reserveLiveLoopFrameSlot(gpuVp.width, gpuVp.height);
+            if (liveCaptureSlot >= 0)
+                renderTarget = m_liveLoopFrames[liveCaptureSlot];
+        }
 
         if (useLiveLoopFrame) {
             const int slot = liveLoopSlotForIndex(m_liveLoopPlaybackIndex);
-            const size_t sz = (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t);
-            memcpy(m_d_compositeOutput.contents, m_liveLoopFrames[slot].contents, sz);
+            if (directPresentPath) {
+                displayBuffer = m_liveLoopFrames[slot];
+            } else {
+                memcpy(m_d_compositeOutput.contents, m_liveLoopFrames[slot].contents, frameBytes);
+            }
         } else if (m_mode3D && m_volumeBuilt) {
             // 3D volumetric ray march
             m_renderer->renderVolume(m_camera, gpuVp.width, gpuVp.height,
@@ -1835,14 +1858,24 @@ void App::render() {
             int cf = m_historic.currentFrame();
             if (hasCachedFrame(cf, gpuVp.width, gpuVp.height)) {
                 // Use pre-baked cached frame (zero render cost)
-                size_t sz = (size_t)gpuVp.width * gpuVp.height * sizeof(uint32_t);
-                memcpy(m_d_compositeOutput.contents, m_cachedFrames[cf].contents, sz);
+                if (directPresentPath) {
+                    displayBuffer = m_cachedFrames[cf];
+                } else {
+                    memcpy(m_d_compositeOutput.contents, m_cachedFrames[cf].contents, frameBytes);
+                }
             } else {
+                if (directPresentPath) {
+                    id<MTLBuffer> cacheBuffer = ensureCachedFrameBuffer(cf, frameBytes);
+                    if (cacheBuffer) {
+                        renderTarget = cacheBuffer;
+                        displayBuffer = cacheBuffer;
+                    }
+                }
                 m_renderer->renderSingleStation(gpuVp, 0,
                                          m_activeProduct, activeThreshold,
-                                         m_d_compositeOutput, srvSpd, srvDir);
+                                         renderTarget, srvSpd, srvDir);
                 // Cache this rendered frame for instant replay
-                requiresGpuCompletionBeforeCpuAccess = true;
+                requiresGpuCompletionBeforeCpuAccess = !directPresentPath;
             }
         } else if (m_showAll) {
             // Mosaic: visible stations only, capped for performance
@@ -1869,11 +1902,13 @@ void App::render() {
             }
             m_renderer->forwardRenderStation(gpuVp, m_activeStationIdx,
                                       m_activeProduct, activeThreshold,
-                                      m_d_compositeOutput, srvSpd, srvDir);
-            requiresGpuCompletionBeforeCpuAccess = true;
+                                      renderTarget, srvSpd, srvDir);
+            displayBuffer = renderTarget;
+            requiresGpuCompletionBeforeCpuAccess = !directPresentPath;
         } else {
             memset(m_d_compositeOutput.contents, 0x00,
                    (size_t)m_viewport.width * m_viewport.height * sizeof(uint32_t));
+            displayBuffer = m_d_compositeOutput;
         }
         // Cross-section: render to separate texture for floating panel
         // In historic mode, use slot 0's data; otherwise use active station
@@ -1907,7 +1942,7 @@ void App::render() {
         if (!useLiveLoopFrame &&
             m_historicMode &&
             hasCachedFrame(m_historic.currentFrame(), gpuVp.width, gpuVp.height) == false) {
-            cacheAnimFrame(m_historic.currentFrame(), m_d_compositeOutput, gpuVp.width, gpuVp.height);
+            cacheAnimFrame(m_historic.currentFrame(), renderTarget, gpuVp.width, gpuVp.height);
         }
 
         if (m_crossSection && m_volumeBuilt && xsStationSlot >= 0 &&
@@ -1923,12 +1958,18 @@ void App::render() {
             !m_crossSection &&
             m_liveLoopEnabled &&
             m_liveLoopCapturePending) {
-            captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height,
-                                 currentLiveLoopCaptureLabel());
+            if (liveCaptureSlot >= 0) {
+                publishLiveLoopFrameSlot(liveCaptureSlot, currentLiveLoopCaptureLabel());
+                displayBuffer = m_liveLoopFrames[liveCaptureSlot];
+            } else {
+                captureLiveLoopFrame(renderTarget, gpuVp.width, gpuVp.height,
+                                     currentLiveLoopCaptureLabel());
+            }
         }
 
         rasterizeBoundaries();
         compositeBoundaries();
+        m_currentDisplayBuffer = displayBuffer ? displayBuffer : m_d_compositeOutput;
 
         // Copy to display texture (macOS only — iOS reads the buffer directly)
         if (!m_singleStationMode) {
@@ -1972,6 +2013,8 @@ void App::resetLiveLoopFrameCache(bool freeMemory) {
     m_liveLoopPlaybackIndex = 0;
     m_liveLoopAccumulator = 0.0f;
     m_liveLoopCapturePending = false;
+    if (m_currentDisplayBuffer && m_currentDisplayBuffer != m_d_compositeOutput)
+        m_currentDisplayBuffer = m_d_compositeOutput;
 }
 
 void App::requestLiveLoopCapture() {
@@ -1993,6 +2036,7 @@ void App::requestLiveLoopBackfill() {
 
     const int desiredFrames = std::max(1, std::min(m_liveLoopLength, MAX_LIVE_LOOP_FRAMES));
     const int requestStationIdx = m_activeStationIdx;
+    const bool promoteForPlayback = m_liveLoopPlaying;
     std::string stationCode;
     std::string currentKey;
     float fallbackLat = 0.0f;
@@ -2026,7 +2070,8 @@ void App::requestLiveLoopBackfill() {
     }
 
     if (m_liveLoopBackfillStationIdx == requestStationIdx &&
-        m_liveLoopBackfillLoading.load()) {
+        m_liveLoopBackfillLoading.load() &&
+        !promoteForPlayback) {
         return;
     }
 
@@ -2071,6 +2116,7 @@ void App::requestLiveLoopBackfill() {
         NEXRAD_HOST,
         listQuery,
         [this, generation, stationCode, currentKey, desiredFrames, dealiasEnabled,
+         promoteForPlayback,
          fallbackLat, fallbackLon, year, month, day, requestStationIdx](const std::string& id, DownloadResult listResult) {
             (void)id;
             if (generation != m_liveLoopBackfillGeneration.load())
@@ -2183,7 +2229,7 @@ void App::requestLiveLoopBackfill() {
             if (!keysToFetch.empty()) {
                 std::mutex orderedFramesMutex;
                 auto backfillDownloader = std::make_shared<Downloader>(
-                    std::min<int>(8, (int)keysToFetch.size()));
+                    promoteForPlayback ? std::min<int>(6, (int)keysToFetch.size()) : 1);
                 for (auto keyIt = keysToFetch.rbegin(); keyIt != keysToFetch.rend(); ++keyIt) {
                     const auto& key = *keyIt;
                     backfillDownloader->queueDownload(
@@ -2293,9 +2339,20 @@ std::string App::currentLiveLoopCaptureLabel() const {
     return "Live";
 }
 
-void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::string& label) {
-    if (!m_liveLoopEnabled || m_liveLoopLength <= 0 || !src || w <= 0 || h <= 0)
-        return;
+id<MTLBuffer> App::ensureCachedFrameBuffer(int frameIdx, size_t size) {
+    if (frameIdx < 0 || frameIdx >= MAX_CACHED_FRAMES || size == 0)
+        return nil;
+
+    if (!m_cachedFrames[frameIdx] || m_cachedFrames[frameIdx].length != size) {
+        m_cachedFrames[frameIdx] = [m_renderer->getDevice() newBufferWithLength:size
+                                                                         options:MTLResourceStorageModeShared];
+    }
+    return m_cachedFrames[frameIdx];
+}
+
+int App::reserveLiveLoopFrameSlot(int w, int h) {
+    if (!m_liveLoopEnabled || m_liveLoopLength <= 0 || w <= 0 || h <= 0)
+        return -1;
 
     if ((m_liveLoopFrameWidth > 0 || m_liveLoopFrameHeight > 0) &&
         (m_liveLoopFrameWidth != w || m_liveLoopFrameHeight != h)) {
@@ -2305,24 +2362,30 @@ void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::strin
     m_liveLoopFrameWidth = w;
     m_liveLoopFrameHeight = h;
 
+    const int slot = m_liveLoopWriteIndex;
+    const size_t sz = (size_t)w * h * sizeof(uint32_t);
+    if (!m_liveLoopFrames[slot] || m_liveLoopFrames[slot].length != sz) {
+        m_liveLoopFrames[slot] = [m_renderer->getDevice() newBufferWithLength:sz
+                                                                      options:MTLResourceStorageModeShared];
+    }
+    return slot;
+}
+
+void App::publishLiveLoopFrameSlot(int slot, const std::string& label) {
+    if (slot < 0 || slot >= MAX_LIVE_LOOP_FRAMES)
+        return;
+
     const bool bufferWasFull = m_liveLoopCount >= m_liveLoopLength;
     const bool preservePlaybackIndex =
         m_liveLoopCount > 0 &&
         (m_liveLoopPlaying || m_liveLoopPlaybackIndex < (m_liveLoopCount - 1));
     const int preservedPlaybackIndex = m_liveLoopPlaybackIndex;
 
-    const int slot = m_liveLoopWriteIndex;
-    const size_t sz = (size_t)w * h * sizeof(uint32_t);
-    if (!m_liveLoopFrames[slot])
-        m_liveLoopFrames[slot] = [m_renderer->getDevice() newBufferWithLength:sz
-                                                                      options:MTLResourceStorageModeShared];
-    memcpy(m_liveLoopFrames[slot].contents, src.contents, sz);
     m_liveLoopLabels[slot] = label;
-
     if (m_liveLoopCount < m_liveLoopLength)
         m_liveLoopCount++;
 
-    m_liveLoopWriteIndex = (m_liveLoopWriteIndex + 1) % MAX_LIVE_LOOP_FRAMES;
+    m_liveLoopWriteIndex = (slot + 1) % MAX_LIVE_LOOP_FRAMES;
     if (preservePlaybackIndex) {
         int nextPlaybackIndex = preservedPlaybackIndex;
         if (bufferWasFull)
@@ -2333,6 +2396,19 @@ void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::strin
     }
     m_liveLoopCapturePending = false;
     m_needsRerender = true;
+}
+
+void App::captureLiveLoopFrame(id<MTLBuffer> src, int w, int h, const std::string& label) {
+    if (!m_liveLoopEnabled || m_liveLoopLength <= 0 || !src || w <= 0 || h <= 0)
+        return;
+
+    const int slot = reserveLiveLoopFrameSlot(w, h);
+    if (slot < 0)
+        return;
+
+    const size_t sz = (size_t)w * h * sizeof(uint32_t);
+    memcpy(m_liveLoopFrames[slot].contents, src.contents, sz);
+    publishLiveLoopFrameSlot(slot, label);
 }
 
 void App::updateLiveLoop(float dt) {
@@ -2431,15 +2507,19 @@ void App::processLiveLoopBackfill() {
         gpuVp.width = m_viewport.width;
         gpuVp.height = m_viewport.height;
 
+        const int loopSlot = reserveLiveLoopFrameSlot(gpuVp.width, gpuVp.height);
+        if (loopSlot < 0)
+            continue;
+
         const float srvSpd = (m_srvMode && m_activeProduct == PROD_VEL) ? m_stormSpeed : 0.0f;
         const float activeThreshold = (m_activeProduct == PROD_VEL)
             ? m_velocityMinThreshold
             : m_dbzMinThreshold;
         m_renderer->forwardRenderStation(gpuVp, kLiveLoopBackfillSlot,
                                          m_activeProduct, activeThreshold,
-                                         m_d_compositeOutput, srvSpd, m_stormDir);
+                                         m_liveLoopFrames[loopSlot], srvSpd, m_stormDir);
         m_renderer->waitForGpu();
-        captureLiveLoopFrame(m_d_compositeOutput, gpuVp.width, gpuVp.height, frame.label);
+        publishLiveLoopFrameSlot(loopSlot, frame.label);
         m_renderer->freeStation(kLiveLoopBackfillSlot);
         processedAny = true;
     }
@@ -2465,15 +2545,14 @@ void App::setLiveLoopEnabled(bool enabled) {
 void App::toggleLiveLoopPlayback() {
     if (!m_liveLoopEnabled)
         setLiveLoopEnabled(true);
-    if (m_liveLoopBackfillLoading || m_liveLoopCount < m_liveLoopLength) {
+    if (m_liveLoopCount < m_liveLoopLength)
         requestLiveLoopBackfill();
-        m_liveLoopPlaying = false;
-        m_liveLoopAccumulator = 0.0f;
-        return;
-    }
+
     if (m_liveLoopCount <= 1) {
         m_liveLoopPlaying = false;
-        requestLiveLoopBackfill();
+        m_liveLoopAccumulator = 0.0f;
+        m_needsRerender = true;
+        m_needsComposite = true;
         return;
     }
 
@@ -2574,6 +2653,7 @@ void App::rasterizeBoundaries() {
     m_boundaryCacheCLon = cx;
     m_boundaryCacheZoom = z;
     m_boundaryCacheWarningSignature = warningSignature;
+    m_boundaryOverlayDirty = true;
 
     uint32_t lineColor = 0xFF555540; // ABGR: muted dark teal
     uint32_t* px = m_boundaryCache.data();
@@ -2638,6 +2718,15 @@ void App::rasterizeBoundaries() {
 void App::compositeBoundaries() {
     int w = m_viewport.width, h = m_viewport.height;
     if (m_boundaryCache.empty() || m_boundaryCacheW != w || m_boundaryCacheH != h) return;
+
+    if (m_singleStationMode) {
+        if (!m_d_boundaryOverlay || !m_boundaryOverlayDirty)
+            return;
+        const size_t bytes = (size_t)w * h * sizeof(uint32_t);
+        std::memcpy(m_d_boundaryOverlay.contents, m_boundaryCache.data(), bytes);
+        m_boundaryOverlayDirty = false;
+        return;
+    }
 
     uint32_t* dst = (uint32_t*)m_d_compositeOutput.contents;
     const uint32_t* src = m_boundaryCache.data();
@@ -2831,6 +2920,11 @@ void App::onResize(int w, int h) {
 
     // Resize compositor output
     m_d_compositeOutput = [m_renderer->getDevice() newBufferWithLength:(size_t)w * h * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    memset(m_d_compositeOutput.contents, 0, (size_t)w * h * sizeof(uint32_t));
+    m_currentDisplayBuffer = m_d_compositeOutput;
+    m_d_boundaryOverlay = [m_renderer->getDevice() newBufferWithLength:(size_t)w * h * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    memset(m_d_boundaryOverlay.contents, 0, (size_t)w * h * sizeof(uint32_t));
+    m_boundaryOverlayDirty = true;
 
     ensureCrossSectionBuffer(w, std::max(200, h / 3));
     invalidateFrameCache(true);

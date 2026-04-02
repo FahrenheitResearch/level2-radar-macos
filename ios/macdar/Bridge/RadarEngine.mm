@@ -107,6 +107,13 @@
     }
 }
 
+- (id<MTLBuffer>)overlayBuffer {
+    @synchronized (self) {
+        if (!_initialized) return nil;
+        return _app->getOverlayBuffer();
+    }
+}
+
 - (int)viewportWidth {
     @synchronized (self) {
         if (!_initialized) return 0;
